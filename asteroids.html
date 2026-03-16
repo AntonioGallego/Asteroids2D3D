@@ -1,0 +1,2176 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASTEROIDS — VECTREX</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    overflow: hidden;
+    height: 100vh; width: 100vw;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Share Tech Mono', monospace;
+  }
+  #gameContainer {
+    position: relative;
+    width: 100vmin; height: 100vmin;
+    max-width: 800px; max-height: 800px;
+  }
+  canvas { display: block; width: 100%; height: 100%; border-radius: 12px; }
+  #crt-overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; border-radius: 12px;
+    background: repeating-linear-gradient(0deg,rgba(0,0,0,0.15) 0px,rgba(0,0,0,0.15) 1px,transparent 1px,transparent 3px);
+    z-index: 12;
+  }
+  #vignette {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; border-radius: 12px;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.7) 100%);
+    z-index: 13;
+  }
+  #bezel {
+    position: absolute; top: -8px; left: -8px;
+    width: calc(100% + 16px); height: calc(100% + 16px);
+    border: 4px solid #1a1a1a; border-radius: 18px;
+    box-shadow: inset 0 0 30px rgba(0,0,0,0.8), 0 0 40px rgba(0,255,180,0.05), 0 0 80px rgba(0,255,180,0.03);
+    pointer-events: none; z-index: 14;
+  }
+  #canvas3d {
+    display: none; position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%; border-radius: 12px; z-index: 0;
+  }
+  #hud2d {
+    z-index: 5;
+  }
+  #mobile-controls {
+    display: none; position: absolute; bottom: 10px; left: 0; right: 0;
+    z-index: 10; justify-content: space-between; padding: 0 15px; pointer-events: none;
+  }
+  #mobile-controls button {
+    pointer-events: auto; width: 60px; height: 60px; border-radius: 50%;
+    border: 2px solid rgba(0,255,180,0.4); background: rgba(0,255,180,0.08);
+    color: rgba(0,255,180,0.7); font-family: 'Share Tech Mono', monospace;
+    font-size: 22px; -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation; user-select: none;
+  }
+  #mobile-controls button:active { background: rgba(0,255,180,0.2); border-color: rgba(0,255,180,0.7); }
+  .ctrl-group { display: flex; gap: 10px; align-items: flex-end; }
+  @media (hover: none) and (pointer: coarse) { #mobile-controls { display: flex; } }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="game"></canvas>
+  <canvas id="canvas3d"></canvas>
+  <div id="crt-overlay"></div>
+  <div id="vignette"></div>
+  <div id="bezel"></div>
+  <div id="mobile-controls">
+    <div class="ctrl-group">
+      <button id="btn-left">◄</button>
+      <button id="btn-right">►</button>
+    </div>
+    <div class="ctrl-group">
+      <button id="btn-thrust">▲</button>
+      <button id="btn-fire">●</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════
+//  SHARED: Canvas, Colors, Input, Audio
+// ═══════════════════════════════════════════════
+const canvas2d = document.getElementById('game');
+const ctx = canvas2d.getContext('2d');
+const canvas3d = document.getElementById('canvas3d');
+const W = 800, H = 800;
+canvas2d.width = W; canvas2d.height = H;
+
+const GLOW = '#00ffb4';
+const BG = '#050808';
+
+// ─── INPUT ───
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Escape'].includes(e.code)) e.preventDefault(); });
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+const mobileState = { left:false, right:false, thrust:false, fire:false };
+function bindMobile(id, key) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  btn.addEventListener('touchstart', e => { e.preventDefault(); mobileState[key]=true; });
+  btn.addEventListener('touchend', e => { e.preventDefault(); mobileState[key]=false; });
+  btn.addEventListener('touchcancel', () => mobileState[key]=false);
+}
+bindMobile('btn-left','left'); bindMobile('btn-right','right');
+bindMobile('btn-thrust','thrust'); bindMobile('btn-fire','fire');
+
+// ─── GAMEPAD ───
+let gamepadConnected = false;
+const gpState = { left:false, right:false, thrust:false, fire:false, stickX:0, stickY:0, lb:false, rb:false, stickLX:0, stickLY:0, start:false };
+const DZ = 0.25;
+window.addEventListener('gamepadconnected', () => gamepadConnected = true);
+window.addEventListener('gamepaddisconnected', () => gamepadConnected = false);
+
+function pollGamepad() {
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  let gp = null;
+  for (let i = 0; i < gps.length; i++) if (gps[i]) { gp = gps[i]; break; }
+  if (!gp) { gpState.left=gpState.right=gpState.thrust=gpState.fire=gpState.lb=gpState.rb=gpState.start=false; gpState.stickX=gpState.stickY=gpState.stickLX=gpState.stickLY=0; return; }
+  gpState.stickLX = Math.abs(gp.axes[0]) > DZ ? gp.axes[0] : 0;
+  gpState.stickLY = Math.abs(gp.axes[1]) > DZ ? gp.axes[1] : 0;
+  gpState.stickX = gpState.stickLX; gpState.stickY = gpState.stickLY;
+  gpState.left  = gpState.stickX < -DZ || (gp.buttons[14] && gp.buttons[14].pressed);
+  gpState.right = gpState.stickX >  DZ || (gp.buttons[15] && gp.buttons[15].pressed);
+  gpState.thrust = (gp.buttons[6] && gp.buttons[6].value>0.15)||(gp.buttons[0] && gp.buttons[0].pressed)||(gp.buttons[12] && gp.buttons[12].pressed);
+  gpState.fire = (gp.buttons[2] && gp.buttons[2].pressed)||(gp.buttons[1] && gp.buttons[1].pressed)||(gp.buttons[7] && gp.buttons[7].value>0.15);
+  gpState.lb = gp.buttons[4] && gp.buttons[4].pressed;
+  gpState.rb = gp.buttons[5] && gp.buttons[5].pressed;
+  gpState.start = (gp.buttons[9] && gp.buttons[9].pressed) || (gp.buttons[8] && gp.buttons[8].pressed);
+}
+
+function isKey(a) {
+  switch(a) {
+    case 'left':   return keys['ArrowLeft']||keys['KeyA']||mobileState.left||gpState.left;
+    case 'right':  return keys['ArrowRight']||keys['KeyD']||mobileState.right||gpState.right;
+    case 'thrust': return keys['ArrowUp']||keys['KeyW']||mobileState.thrust||gpState.thrust;
+    case 'fire':   return keys['Space']||mobileState.fire||gpState.fire;
+    case 'up':     return keys['ArrowUp']||keys['KeyW']||gpState.stickY < -DZ;
+    case 'down':   return keys['ArrowDown']||keys['KeyS']||gpState.stickY > DZ;
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  AUDIO ENGINE (robust — resume on every call)
+// ═══════════════════════════════════════════════
+let audioCtx=null, audioStarted=false;
+
+function ensureAudio(){
+  try {
+    if(!audioCtx) audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==='suspended') audioCtx.resume();
+  } catch(e){}
+}
+function startAudio(){
+  if(audioStarted)return;
+  ensureAudio();
+  audioStarted=true;
+}
+['keydown','mousedown','touchstart','pointerdown'].forEach(e=>window.addEventListener(e,startAudio,{once:false}));
+
+// Helper: always resume + get safe current time
+function aT(){ ensureAudio(); return audioCtx ? audioCtx.currentTime : 0; }
+
+function sfxShoot(){
+  try{
+    if(!audioCtx)return; const t=aT();
+    const o=audioCtx.createOscillator(),g=audioCtx.createGain();
+    o.type='square';o.frequency.setValueAtTime(880,t);o.frequency.exponentialRampToValueAtTime(110,t+0.15);
+    g.gain.setValueAtTime(0.12,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.15);
+    o.connect(g).connect(audioCtx.destination);o.start(t);o.stop(t+0.16);
+  }catch(e){}
+}
+function sfxAsteroidExplode(size){
+  try{
+    if(!audioCtx)return;const t=aT(),dur=0.15+size*0.1;
+    const buf=audioCtx.createBuffer(1,Math.max(1,audioCtx.sampleRate*dur|0),audioCtx.sampleRate),d=buf.getChannelData(0);
+    for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*(1-i/d.length);
+    const n=audioCtx.createBufferSource();n.buffer=buf;
+    const ng=audioCtx.createGain();ng.gain.setValueAtTime(0.1+size*0.03,t);ng.gain.exponentialRampToValueAtTime(0.001,t+dur);
+    const o=audioCtx.createOscillator(),og=audioCtx.createGain();
+    o.type='triangle';o.frequency.setValueAtTime(60+size*20,t);o.frequency.exponentialRampToValueAtTime(20,t+dur);
+    og.gain.setValueAtTime(0.08*size,t);og.gain.exponentialRampToValueAtTime(0.001,t+dur);
+    n.connect(ng).connect(audioCtx.destination);o.connect(og).connect(audioCtx.destination);
+    n.start(t);n.stop(t+dur+0.01);o.start(t);o.stop(t+dur+0.01);
+  }catch(e){}
+}
+function sfxShipExplode(){
+  try{
+    if(!audioCtx)return;const t=aT();
+    const buf=audioCtx.createBuffer(1,Math.max(1,audioCtx.sampleRate*0.8|0),audioCtx.sampleRate),d=buf.getChannelData(0);
+    for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,1.5);
+    const n=audioCtx.createBufferSource();n.buffer=buf;
+    const ng=audioCtx.createGain();ng.gain.setValueAtTime(0.2,t);ng.gain.exponentialRampToValueAtTime(0.001,t+0.8);
+    const o=audioCtx.createOscillator(),og=audioCtx.createGain();
+    o.type='sawtooth';o.frequency.setValueAtTime(120,t);o.frequency.exponentialRampToValueAtTime(15,t+0.6);
+    og.gain.setValueAtTime(0.18,t);og.gain.exponentialRampToValueAtTime(0.001,t+0.6);
+    const o2=audioCtx.createOscillator(),o2g=audioCtx.createGain();
+    o2.type='square';o2.frequency.setValueAtTime(200,t);o2.frequency.exponentialRampToValueAtTime(25,t+0.5);
+    o2g.gain.setValueAtTime(0.08,t);o2g.gain.exponentialRampToValueAtTime(0.001,t+0.5);
+    n.connect(ng).connect(audioCtx.destination);o.connect(og).connect(audioCtx.destination);o2.connect(o2g).connect(audioCtx.destination);
+    n.start(t);n.stop(t+0.81);o.start(t);o.stop(t+0.61);o2.start(t);o2.stop(t+0.51);
+  }catch(e){}
+}
+let thrustOsc=null,thrustGain=null,thrustAudioOn=false;
+function sfxThrustOn(){
+  try{
+    if(!audioCtx||thrustOsc)return; const t=aT();
+    thrustOsc=audioCtx.createOscillator();thrustGain=audioCtx.createGain();
+    thrustOsc.type='sawtooth';thrustOsc.frequency.setValueAtTime(42,t);
+    thrustGain.gain.setValueAtTime(0,t);thrustGain.gain.linearRampToValueAtTime(0.06,t+0.1);
+    const bl=audioCtx.sampleRate*2,bb=audioCtx.createBuffer(1,bl,audioCtx.sampleRate),dd=bb.getChannelData(0);
+    for(let i=0;i<bl;i++)dd[i]=Math.random()*2-1;
+    const ns=audioCtx.createBufferSource();ns.buffer=bb;ns.loop=true;
+    const nng=audioCtx.createGain();nng.gain.setValueAtTime(0.025,t);
+    thrustOsc.connect(thrustGain).connect(audioCtx.destination);
+    ns.connect(nng).connect(audioCtx.destination);thrustOsc.start(t);ns.start(t);
+    thrustOsc._ns=ns;thrustOsc._ng=nng;
+  }catch(e){ thrustOsc=null;thrustGain=null; }
+}
+function sfxThrustOff(){
+  if(!thrustOsc)return;
+  try{
+    const t=aT();
+    thrustGain.gain.linearRampToValueAtTime(0,t+0.1);
+    thrustOsc._ng.gain.linearRampToValueAtTime(0,t+0.1);
+    const r=thrustOsc;
+    setTimeout(()=>{try{r.stop();r._ns.stop();}catch(e){}},200);
+  }catch(e){}
+  thrustOsc=null;thrustGain=null;
+}
+// Force-kill any lingering thrust audio (used on mode switch)
+function killThrust(){ thrustAudioOn=false; sfxThrustOff(); }
+
+function playStartJingle(){
+  try{
+    if(!audioCtx)return;const t=aT();
+    [523.25,587.33,659.25,783.99,880,1046.5].forEach((f,i)=>{
+      const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type='triangle';
+      const s=t+i*0.12;o.frequency.setValueAtTime(f,s);
+      g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(0.1,s+0.01);
+      g.gain.setValueAtTime(0.1,s+0.06);g.gain.exponentialRampToValueAtTime(0.001,s+0.15);
+      o.connect(g).connect(audioCtx.destination);o.start(s);o.stop(s+0.16);
+    });
+  }catch(e){}
+}
+function playGameOverJingle(){
+  try{
+    if(!audioCtx)return;const t=aT();
+    const notes=[{f:622.25,d:0.25},{f:587.33,d:0.25},{f:523.25,d:0.22},{f:466.16,d:0.35},{f:415.30,d:0.22},{f:349.23,d:0.22},{f:311.13,d:0.55},{f:293.66,d:0.8}];
+    let off=0;
+    notes.forEach((n,i)=>{
+      const o=audioCtx.createOscillator(),g=audioCtx.createGain();
+      o.type=i%2===0?'triangle':'square';const s=t+off+0.3;
+      o.frequency.setValueAtTime(n.f,s);
+      if(n.d>0.3){const l=audioCtx.createOscillator(),lg=audioCtx.createGain();l.frequency.setValueAtTime(5,s);lg.gain.setValueAtTime(4,s);l.connect(lg).connect(o.frequency);l.start(s+0.15);l.stop(s+n.d+0.1);}
+      const v=o.type==='square'?0.05:0.09;
+      g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(v,s+0.015);
+      g.gain.setValueAtTime(v,s+n.d*0.5);g.gain.exponentialRampToValueAtTime(0.001,s+n.d);
+      o.connect(g).connect(audioCtx.destination);o.start(s);o.stop(s+n.d+0.02);
+      off+=n.d*0.85;
+    });
+  }catch(e){}
+}
+
+// ═══════════════════════════════════════════════
+//  DRAWING HELPERS (2D)
+// ═══════════════════════════════════════════════
+function setGlow(a,blur){ctx.shadowColor=GLOW;ctx.shadowBlur=blur||8;ctx.globalAlpha=a||1;ctx.strokeStyle=GLOW;ctx.lineWidth=1.5;}
+function drawPoly(pts,close){ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i].x,pts[i].y);if(close)ctx.closePath();ctx.stroke();}
+
+// ═══════════════════════════════════════════════
+//  MODE MANAGEMENT & MENU
+// ═══════════════════════════════════════════════
+let currentMode = 'menu';
+let menuSelection = 0;
+let menuDebounce = 0;
+let menuAsteroidsArr = [];
+
+function initMenuAsteroids() {
+  menuAsteroidsArr = [];
+  for (let i = 0; i < 6; i++) {
+    const r = 30 + Math.random() * 30;
+    const verts = 8 + Math.floor(Math.random() * 5);
+    const shape = [];
+    for (let v = 0; v < verts; v++) {
+      const a = (v / verts) * Math.PI * 2, w = r * (0.7 + Math.random() * 0.6);
+      shape.push({ x: Math.cos(a) * w, y: Math.sin(a) * w });
+    }
+    menuAsteroidsArr.push({
+      x: Math.random() * W, y: Math.random() * H,
+      vx: (Math.random() - 0.5) * 1.2, vy: (Math.random() - 0.5) * 1.2,
+      rot: 0, rotSpd: (Math.random() - 0.5) * 0.015, shape
+    });
+  }
+}
+initMenuAsteroids();
+
+function drawMenu() {
+  ctx.fillStyle = BG; ctx.globalAlpha = 1; ctx.fillRect(0, 0, W, H);
+
+  // Floating asteroids in background
+  menuAsteroidsArr.forEach(a => {
+    a.x += a.vx; a.y += a.vy; a.rot += a.rotSpd;
+    if (a.x < -60) a.x += W + 120; if (a.x > W + 60) a.x -= W + 120;
+    if (a.y < -60) a.y += H + 120; if (a.y > H + 60) a.y -= H + 120;
+    ctx.save(); ctx.translate(a.x, a.y); ctx.rotate(a.rot);
+    setGlow(0.15, 4); drawPoly(a.shape, true);
+    ctx.restore();
+  });
+
+  setGlow(1, 24); ctx.fillStyle = GLOW; ctx.textAlign = 'center';
+  ctx.font = '56px "Share Tech Mono", monospace'; ctx.fillText('ASTEROIDS', W / 2, H / 2 - 120);
+  setGlow(0.5, 8); ctx.font = '14px "Share Tech Mono", monospace';
+  ctx.fillText('— VECTREX EDITION —', W / 2, H / 2 - 80);
+
+  const opts = ['CLASSIC 2D', 'SPACE COMBAT 3D', 'TRENCH RUN'];
+  opts.forEach((label, i) => {
+    const y = H / 2 - 10 + i * 50;
+    const sel = menuSelection === i;
+    setGlow(sel ? 1 : 0.3, sel ? 14 : 4);
+    ctx.font = (sel ? '26' : '18') + 'px "Share Tech Mono", monospace';
+    ctx.fillStyle = GLOW;
+    ctx.fillText((sel ? '▸ ' : '  ') + label, W / 2, y);
+  });
+
+  // Decorative icon
+  ctx.save();
+  if (menuSelection === 0) {
+    ctx.translate(W / 2, H / 2 + 140); ctx.scale(2.2, 2.2);
+    setGlow(0.25, 6);
+    drawPoly([{ x: 18, y: 0 }, { x: -12, y: -10 }, { x: -7, y: 0 }, { x: -12, y: 10 }], true);
+  } else if (menuSelection === 1) {
+    ctx.translate(W / 2, H / 2 + 145);
+    const s = 30, o = 16;
+    setGlow(0.25, 5);
+    ctx.beginPath(); ctx.moveTo(-s,-s); ctx.lineTo(s,-s); ctx.lineTo(s,s); ctx.lineTo(-s,s); ctx.closePath(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-s+o,-s-o); ctx.lineTo(s+o,-s-o); ctx.lineTo(s+o,s-o); ctx.lineTo(-s+o,s-o); ctx.closePath(); ctx.stroke();
+    [[-s,-s],[ s,-s],[ s, s],[-s, s]].forEach(p => { ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(p[0]+o,p[1]-o); ctx.stroke(); });
+    setGlow(0.5, 8);
+    ctx.save(); ctx.translate(4, -2); ctx.scale(1.2, 1.2); ctx.rotate(-0.3);
+    drawPoly([{ x: 8, y: 0 }, { x: -5, y: -4 }, { x: -3, y: 0 }, { x: -5, y: 4 }], true);
+    ctx.restore();
+  } else {
+    // Trench icon — perspective lines converging
+    ctx.translate(W / 2, H / 2 + 140);
+    setGlow(0.25, 5);
+    // Trench walls
+    ctx.beginPath(); ctx.moveTo(-40, 25); ctx.lineTo(-5, -20); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(40, 25); ctx.lineTo(5, -20); ctx.stroke();
+    // Floor
+    ctx.beginPath(); ctx.moveTo(-40, 25); ctx.lineTo(40, 25); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-5, -20); ctx.lineTo(5, -20); ctx.stroke();
+    // Floor lines
+    for (let i = 1; i < 5; i++) {
+      const t = i / 5;
+      const lx = -40 + t * 35, rx = 40 - t * 35, ly = 25 - t * 45;
+      ctx.globalAlpha = 0.15;
+      ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(rx, ly); ctx.stroke();
+    }
+    // Ship
+    setGlow(0.5, 8); ctx.globalAlpha = 1;
+    ctx.save(); ctx.translate(0, 18); ctx.scale(0.8, 0.8);
+    drawPoly([{ x: 8, y: 0 }, { x: -5, y: -6 }, { x: -3, y: 0 }, { x: -5, y: 6 }], true);
+    ctx.restore();
+  }
+  ctx.restore();
+
+  setGlow(0.35, 4); ctx.font = '12px "Share Tech Mono", monospace';
+  ctx.fillText('↑↓ SELECCIONAR    ESPACIO CONFIRMAR    ESC VOLVER', W / 2, H - 40);
+  if (gamepadConnected) {
+    setGlow(0.5, 6);
+    ctx.fillText('🎮 STICK + A CONFIRMAR · START MENÚ', W / 2, H - 20);
+  }
+}
+
+function updateMenu() {
+  menuDebounce--;
+  if (menuDebounce > 0) return;
+  if (isKey('up')) { menuSelection = (menuSelection + 2) % 3; menuDebounce = 12; }
+  if (isKey('down')) { menuSelection = (menuSelection + 1) % 3; menuDebounce = 12; }
+  if (isKey('fire') || isKey('thrust') || keys['Enter']) {
+    menuDebounce = 30;
+    if (menuSelection === 0) { currentMode = '2d'; init2D(); }
+    else if (menuSelection === 1) { currentMode = '3d'; init3D(); }
+    else { currentMode = 'trench'; initTrench(); }
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  2D ASTEROIDS
+// ═══════════════════════════════════════════════
+let ship2, asteroids2, bullets2, particles2, score2, lives2, level2, state2, stateTimer2, screenShake2, fireCooldown2;
+
+function init2D() {
+  canvas2d.style.display='block'; canvas3d.style.display='none';
+  canvas2d.style.position=''; canvas2d.style.zIndex=''; canvas2d.style.pointerEvents='';
+  ship2={x:W/2,y:H/2,angle:-Math.PI/2,vx:0,vy:0,thrust:false,invincible:120,flickerTimer:0,dead:false,respawnTimer:0};
+  asteroids2=[];bullets2=[];particles2=[];score2=0;lives2=3;level2=0;state2='title';stateTimer2=0;screenShake2=0;fireCooldown2=0;
+}
+function makeShape(r,v){const p=[];for(let i=0;i<v;i++){const a=(i/v)*Math.PI*2,w=r*(0.7+Math.random()*0.6);p.push({x:Math.cos(a)*w,y:Math.sin(a)*w});}return p;}
+function spawnAst2(x,y,sz){const rm={3:55,2:28,1:14},r=rm[sz],a=Math.random()*Math.PI*2,sp=0.6+Math.random()*1.2+(3-sz)*0.3;asteroids2.push({x,y,r,size:sz,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,rot:0,rotSpd:(Math.random()-0.5)*0.03,shape:makeShape(r,8+Math.floor(Math.random()*5))});}
+function spawnWave2(){level2++;for(let i=0;i<3+level2;i++){let x,y;do{x=Math.random()*W;y=Math.random()*H;}while(Math.hypot(x-ship2.x,y-ship2.y)<180);spawnAst2(x,y,3);}}
+function spawnExp2(x,y,c,sp,lf){for(let i=0;i<c;i++){const a=Math.random()*Math.PI*2,s=Math.random()*sp;particles2.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:lf*(0.5+Math.random()*0.5),maxLife:lf,size:1+Math.random()*2});}}
+function spawnThrP(){const ba=ship2.angle+Math.PI,sp=(Math.random()-0.5)*0.6,s=2+Math.random()*3;particles2.push({x:ship2.x+Math.cos(ba)*12,y:ship2.y+Math.sin(ba)*12,vx:Math.cos(ba+sp)*s+ship2.vx*0.3,vy:Math.sin(ba+sp)*s+ship2.vy*0.3,life:15+Math.random()*10,maxLife:25,size:1.5});}
+function wrap2(o){if(o.x<-60)o.x+=W+120;if(o.x>W+60)o.x-=W+120;if(o.y<-60)o.y+=H+120;if(o.y>H+60)o.y-=H+120;}
+function cc2(a,b,ra,rb){return Math.hypot(a.x-b.x,a.y-b.y)<ra+rb;}
+
+function update2D(){
+  stateTimer2++;
+  if(state2==='title'){
+    if(isKey('fire')||isKey('thrust')){state2='playing';stateTimer2=0;ship2.invincible=120;spawnWave2();playStartJingle();}
+    if(asteroids2.length===0)for(let i=0;i<6;i++)spawnAst2(Math.random()*W,Math.random()*H,3);
+    asteroids2.forEach(a=>{a.x+=a.vx;a.y+=a.vy;a.rot+=a.rotSpd;wrap2(a);});return;
+  }
+  if(state2==='gameover'){
+    asteroids2.forEach(a=>{a.x+=a.vx;a.y+=a.vy;a.rot+=a.rotSpd;wrap2(a);});
+    particles2.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.life--;});particles2=particles2.filter(p=>p.life>0);
+    if(stateTimer2>90&&isKey('fire')){goToMenu();}return;
+  }
+  if(screenShake2>0)screenShake2-=0.5;
+  if(!ship2.dead){
+    if(isKey('left'))ship2.angle-=0.065;if(isKey('right'))ship2.angle+=0.065;
+    const an=gpState.stickX;if(Math.abs(an)>0)ship2.angle+=an*0.075;
+    ship2.thrust=isKey('thrust');
+    if(ship2.thrust){ship2.vx+=Math.cos(ship2.angle)*0.12;ship2.vy+=Math.sin(ship2.angle)*0.12;if(Math.random()<0.6)spawnThrP();if(!thrustAudioOn){sfxThrustOn();thrustAudioOn=true;}}
+    else{if(thrustAudioOn){sfxThrustOff();thrustAudioOn=false;}}
+    ship2.vx*=0.993;ship2.vy*=0.993;const sp=Math.hypot(ship2.vx,ship2.vy);if(sp>6){ship2.vx=(ship2.vx/sp)*6;ship2.vy=(ship2.vy/sp)*6;}
+    ship2.x+=ship2.vx;ship2.y+=ship2.vy;wrap2(ship2);if(ship2.invincible>0)ship2.invincible--;
+    fireCooldown2--;if(isKey('fire')&&fireCooldown2<=0){bullets2.push({x:ship2.x+Math.cos(ship2.angle)*20,y:ship2.y+Math.sin(ship2.angle)*20,vx:Math.cos(ship2.angle)*8+ship2.vx*0.3,vy:Math.sin(ship2.angle)*8+ship2.vy*0.3,life:55});fireCooldown2=10;sfxShoot();}
+  }else{ship2.respawnTimer--;if(ship2.respawnTimer<=0){ship2.dead=false;ship2.x=W/2;ship2.y=H/2;ship2.vx=0;ship2.vy=0;ship2.angle=-Math.PI/2;ship2.invincible=120;}}
+  bullets2.forEach(b=>{b.x+=b.vx;b.y+=b.vy;b.life--;wrap2(b);});bullets2=bullets2.filter(b=>b.life>0);
+  asteroids2.forEach(a=>{a.x+=a.vx;a.y+=a.vy;a.rot+=a.rotSpd;wrap2(a);});
+  for(let i=bullets2.length-1;i>=0;i--){for(let j=asteroids2.length-1;j>=0;j--){if(cc2(bullets2[i],asteroids2[j],3,asteroids2[j].r)){const a=asteroids2[j];spawnExp2(a.x,a.y,8+a.size*4,2+a.size,20+a.size*5);screenShake2=3+a.size*2;sfxAsteroidExplode(a.size);score2+={3:20,2:50,1:100}[a.size];if(a.size>1){spawnAst2(a.x,a.y,a.size-1);spawnAst2(a.x,a.y,a.size-1);}asteroids2.splice(j,1);bullets2.splice(i,1);break;}}}
+  if(!ship2.dead&&ship2.invincible<=0){for(let j=asteroids2.length-1;j>=0;j--){if(cc2(ship2,asteroids2[j],10,asteroids2[j].r)){spawnExp2(ship2.x,ship2.y,30,4,40);screenShake2=12;ship2.dead=true;lives2--;sfxShipExplode();if(thrustAudioOn){sfxThrustOff();thrustAudioOn=false;}if(lives2<=0){state2='gameover';stateTimer2=0;playGameOverJingle();}else ship2.respawnTimer=120;break;}}}
+  particles2.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vx*=0.98;p.vy*=0.98;p.life--;});particles2=particles2.filter(p=>p.life>0);
+  if(asteroids2.length===0&&state2==='playing')spawnWave2();
+}
+
+function render2D(){
+  ctx.save();
+  if(screenShake2>0)ctx.translate((Math.random()-0.5)*screenShake2*2,(Math.random()-0.5)*screenShake2*2);
+  ctx.fillStyle=BG;ctx.globalAlpha=0.82;ctx.fillRect(-10,-10,W+20,H+20);ctx.globalAlpha=1;ctx.fillStyle=GLOW;
+  const dShip=()=>{if(ship2.dead)return;if(ship2.invincible>0){ship2.flickerTimer++;if(ship2.flickerTimer%6<3)return;}ctx.save();ctx.translate(ship2.x,ship2.y);ctx.rotate(ship2.angle);setGlow(1,10);drawPoly([{x:18,y:0},{x:-12,y:-10},{x:-7,y:0},{x:-12,y:10}],true);if(ship2.thrust){setGlow(0.6+Math.random()*0.4,14);const fl=Math.random()*8;drawPoly([{x:-7,y:-5},{x:-18-fl,y:0},{x:-7,y:5}],false);}ctx.restore();};
+  const dAst=a=>{ctx.save();ctx.translate(a.x,a.y);ctx.rotate(a.rot);setGlow(0.9,6);drawPoly(a.shape,true);ctx.restore();};
+  const dBul=b=>{setGlow(1,12);ctx.beginPath();ctx.arc(b.x,b.y,2,0,Math.PI*2);ctx.fill();ctx.fillStyle=GLOW;ctx.stroke();};
+  const dPar=p=>{const al=p.life/p.maxLife;setGlow(al*0.8,4);ctx.beginPath();ctx.arc(p.x,p.y,p.size*al,0,Math.PI*2);ctx.fill();ctx.fillStyle=GLOW;};
+
+  if(state2==='title'){
+    asteroids2.forEach(dAst);setGlow(1,20);ctx.fillStyle=GLOW;ctx.textAlign='center';ctx.font='56px "Share Tech Mono",monospace';ctx.fillText('ASTEROIDS',W/2,H/2-60);
+    setGlow(0.5,8);ctx.font='14px "Share Tech Mono",monospace';ctx.fillText('— CLASSIC 2D —',W/2,H/2-20);
+    if(Math.sin(Date.now()*0.005)>0){setGlow(0.8,10);ctx.font='18px "Share Tech Mono",monospace';ctx.fillText('PRESS SPACE TO START',W/2,H/2+50);}
+    setGlow(0.35,4);ctx.font='12px "Share Tech Mono",monospace';ctx.fillText('← → GIRAR · ↑ IMPULSO · ESPACIO DISPARAR',W/2,H/2+100);
+    if(gamepadConnected){setGlow(0.5,6);ctx.fillText('🎮 STICK · LT/A IMPULSO · RT/X DISPARAR',W/2,H/2+125);}
+  }else if(state2==='gameover'){
+    asteroids2.forEach(dAst);particles2.forEach(dPar);
+    setGlow(1,20);ctx.fillStyle=GLOW;ctx.textAlign='center';ctx.font='48px "Share Tech Mono",monospace';ctx.fillText('GAME OVER',W/2,H/2-30);
+    setGlow(0.7,8);ctx.font='22px "Share Tech Mono",monospace';ctx.fillText('SCORE: '+score2,W/2,H/2+20);
+    if(stateTimer2>90){const p=0.45+Math.sin(Date.now()*0.004)*0.35;setGlow(p,8+p*4);ctx.font='16px "Share Tech Mono",monospace';ctx.fillText('PRESS SPACE TO CONTINUE',W/2,H/2+70);}
+  }else{
+    asteroids2.forEach(dAst);bullets2.forEach(dBul);particles2.forEach(dPar);dShip();
+    setGlow(0.9,6);ctx.font='22px "Share Tech Mono",monospace';ctx.fillStyle=GLOW;ctx.textAlign='left';ctx.fillText(String(score2).padStart(6,'0'),25,40);
+    for(let i=0;i<lives2;i++){ctx.save();ctx.translate(35+i*28,65);ctx.rotate(-Math.PI/2);ctx.scale(0.6,0.6);setGlow(0.7,4);drawPoly([{x:18,y:0},{x:-12,y:-10},{x:-7,y:0},{x:-12,y:10}],true);ctx.restore();}
+    ctx.textAlign='right';ctx.fillStyle=GLOW;ctx.globalAlpha=0.5;ctx.font='14px "Share Tech Mono",monospace';ctx.fillText('LEVEL '+level2,W-25,40);ctx.globalAlpha=1;
+    if(gamepadConnected){ctx.save();setGlow(0.4,4);ctx.font='11px "Share Tech Mono",monospace';ctx.fillStyle=GLOW;ctx.textAlign='right';ctx.fillText('🎮 GAMEPAD',W-25,H-20);ctx.restore();}
+  }
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════════
+//  3D ASTEROIDS — TOROIDAL SPACE, 6DOF, HIDDEN LINES
+// ═══════════════════════════════════════════════
+let scene3,camera3,renderer3,shipMesh3,shipGroup3,shipSolid3;
+let asteroids3=[],bullets3=[],particles3d=[];
+let score3=0,lives3=3,level3=0,state3='title',stateTimer3=0,fireCooldown3=0;
+let shipVel3,shipDead3,shipRespawn3,shipInvincible3;
+const CUBE=3000, HALF=CUBE/2;
+let camLerpTarget;
+let thrustFlame3,thrustFlameSolid3;
+let starField;
+let camRoll = 0;
+
+// Speed system
+const NORMAL_SPEED = 1;
+const MAX_BOOST_SPEED = 20.0;
+const HYPER_SPEED = 100.0;
+const BOOST_TIME = 600; // 10 seconds at 60fps
+let shipSpeed = NORMAL_SPEED;
+let boostTimer = 0; // counts up while boosting
+let boostPhase = 'normal'; // 'normal', 'boosting', 'hyper'
+let hyperTimer = 0; // duration of hyper phase
+const HYPER_DURATION = 90; // 1.5 sec at hyper
+let starLinesMesh = null; // stretched star lines for hyper effect
+let baseFOV = 65;
+
+// Angular velocity (inertial flight model)
+let angVelPitch = 0, angVelYaw = 0, angVelRoll = 0;
+const ANG_ACCEL = 0.003;      // how fast rotation builds up per frame
+const ANG_MAX_PITCH = 0.035;  // max pitch rate
+const ANG_MAX_YAW = 0.02;     // max direct yaw rate (rudder)
+const ANG_MAX_ROLL = 0.05;    // max roll rate
+const ANG_DAMPING = 0.90;     // rotation decay when no input
+const AUTO_YAW_FACTOR = 0.018; // how much bank angle induces auto-yaw
+
+// ── Hidden-line material factory ──
+// Each object gets TWO meshes: a solid backface-fill in BG color (writes depth),
+// then a wireframe on top (reads depth). Back faces get hidden by the solid pass.
+const hlrBgColor = new THREE.Color(0x050808);
+
+function makeHLRPair(geo, parent, opts={}) {
+  const solidMat = new THREE.MeshBasicMaterial({
+    color: hlrBgColor,
+    side: THREE.FrontSide,
+    depthWrite: true,
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
+  });
+  const wireMat = new THREE.MeshBasicMaterial({
+    color: opts.color || 0x00ffb4,
+    wireframe: true,
+    transparent: !!opts.opacity,
+    opacity: opts.opacity || 1.0,
+    depthWrite: false,
+  });
+  const solid = new THREE.Mesh(geo, solidMat);
+  const wire = new THREE.Mesh(geo, wireMat);
+  solid.renderOrder = opts.order || 0;
+  wire.renderOrder = (opts.order || 0) + 1;
+  parent.add(solid);
+  parent.add(wire);
+  return { solid, wire, wireMat };
+}
+
+function init3D(){
+  canvas3d.style.display='block';
+  canvas2d.style.display='block';
+  canvas2d.style.position='absolute'; canvas2d.style.top='0'; canvas2d.style.left='0';
+  canvas2d.style.zIndex='5'; canvas2d.style.pointerEvents='none';
+
+  scene3=new THREE.Scene();
+  scene3.background=new THREE.Color(0x050808);
+  scene3.fog = new THREE.Fog(0x050808, 800, 2500);
+
+  camera3=new THREE.PerspectiveCamera(65,1,0.1,6000);
+  camera3.position.set(0,0,40);
+  camLerpTarget=new THREE.Vector3();
+
+  if(!renderer3){
+    renderer3=new THREE.WebGLRenderer({canvas:canvas3d,antialias:true});
+    renderer3.setSize(800,800);
+    renderer3.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    renderer3.sortObjects = true;
+  }
+
+  // ── Starfield for spatial reference ──
+  const starGeo = new THREE.BufferGeometry();
+  const starCount = 1200;
+  const starPos = new Float32Array(starCount * 3);
+  for (let i = 0; i < starCount; i++) {
+    starPos[i*3]   = (Math.random()-0.5) * CUBE * 1.8;
+    starPos[i*3+1] = (Math.random()-0.5) * CUBE * 1.8;
+    starPos[i*3+2] = (Math.random()-0.5) * CUBE * 1.8;
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+  starField = new THREE.Points(starGeo, new THREE.PointsMaterial({
+    color: 0x00ffb4, size: 1.5, transparent: true, opacity: 0.25,
+    fog: true, sizeAttenuation: true
+  }));
+  scene3.add(starField);
+
+  // ── Beacon stars — bright reference points scattered in space ──
+  const beaconColors = [0x00ffb4, 0x44aaff, 0xff8844, 0xffdd44, 0xff44aa];
+  for (let i = 0; i < 1000; i++) {
+    const bGroup = new THREE.Group();
+    bGroup.position.set(
+      (Math.random()-0.5) * CUBE * 0.9,
+      (Math.random()-0.5) * CUBE * 0.9,
+      (Math.random()-0.5) * CUBE * 0.9
+    );
+    const bColor = beaconColors[i % beaconColors.length];
+    // Bright center point
+    const bGeo = new THREE.SphereGeometry(2, 6, 6);
+    const bMat = new THREE.MeshBasicMaterial({color: bColor, transparent: true, opacity: 0.6, fog: true});
+    bGroup.add(new THREE.Mesh(bGeo, bMat));
+    // Glow ring
+    const rGeo = new THREE.TorusGeometry(4, 0.3, 3, 12);
+    const rMat = new THREE.MeshBasicMaterial({color: bColor, transparent: true, opacity: 0.2, fog: true, depthWrite: false});
+    const ring = new THREE.Mesh(rGeo, rMat);
+    ring.rotation.x = Math.random() * Math.PI;
+    ring.rotation.y = Math.random() * Math.PI;
+    bGroup.add(ring);
+    scene3.add(bGroup);
+  }
+
+  // ── Star lines for boost/hyperspace effect ──
+  const lineCount = 200;
+  const lineGeo = new THREE.BufferGeometry();
+  const linePositions = new Float32Array(lineCount * 6); // 2 vertices per line
+  for (let i = 0; i < lineCount; i++) {
+    const x = (Math.random()-0.5) * 120;
+    const y = (Math.random()-0.5) * 120;
+    const z = -(Math.random() * 200 + 20);
+    linePositions[i*6]   = x; linePositions[i*6+1] = y; linePositions[i*6+2] = z;
+    linePositions[i*6+3] = x; linePositions[i*6+4] = y; linePositions[i*6+5] = z; // same point initially
+  }
+  lineGeo.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+  starLinesMesh = new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({
+    color: 0x00ffb4, transparent: true, opacity: 0
+  }));
+  starLinesMesh.frustumCulled = false;
+  scene3.add(starLinesMesh);
+
+  // ── Sparse grid markers ──
+  const markerMat = new THREE.LineBasicMaterial({color:0x00ffb4,transparent:true,opacity:0.06, fog:true});
+  for (let x = -HALF; x <= HALF; x += 300) {
+    for (let z = -HALF; z <= HALF; z += 300) {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(x, -HALF, z), new THREE.Vector3(x, -HALF+15, z)
+      ]);
+      scene3.add(new THREE.Line(g, markerMat));
+    }
+  }
+
+  // ── Ship — X-fighter style built from geometry ──
+  shipGroup3 = new THREE.Group();
+
+  // Build X-fighter with manual vertices
+  // Ship faces -Z direction (forward)
+  function buildXFighter() {
+    const shipContainer = new THREE.Group();
+
+    // Main fuselage — elongated octagonal prism
+    const fuselageShape = new THREE.Shape();
+    const fR = 0.5, fLen = 5;
+    // Octagon cross-section
+    const sides = 6;
+    for (let i = 0; i <= sides; i++) {
+      const a = (i / sides) * Math.PI * 2 - Math.PI/2;
+      const x = Math.cos(a) * fR, y = Math.sin(a) * fR;
+      if (i === 0) fuselageShape.moveTo(x, y);
+      else fuselageShape.lineTo(x, y);
+    }
+    const fuselageGeo = new THREE.ExtrudeGeometry(fuselageShape, {
+      depth: fLen, bevelEnabled: false
+    });
+    fuselageGeo.translate(0, 0, -fLen/2);
+    const fuselageHLR = makeHLRPair(fuselageGeo, shipContainer, {order: 10});
+
+    // Nose cone
+    const noseGeo = new THREE.ConeGeometry(0.5, 2.2, 6);
+    noseGeo.rotateX(Math.PI/2);
+    noseGeo.translate(0, 0, -fLen/2 - 1.1);
+    makeHLRPair(noseGeo, shipContainer, {order: 10});
+
+    // 4 Wing struts — X configuration
+    const wingPositions = [
+      { x:  0.5, y:  0.5, rotZ: Math.PI * 0.12 },   // top-right
+      { x: -0.5, y:  0.5, rotZ: -Math.PI * 0.12 },  // top-left
+      { x:  0.5, y: -0.5, rotZ: -Math.PI * 0.12 },  // bottom-right
+      { x: -0.5, y: -0.5, rotZ: Math.PI * 0.12 },   // bottom-left
+    ];
+
+    wingPositions.forEach((wp, idx) => {
+      // Wing panel — flat box
+      const wingGeo = new THREE.BoxGeometry(3.8, 0.08, 2.8);
+      const wingAngle = (idx < 2) ? 0.28 : -0.28; // splay outward
+      const sideSign = (idx % 2 === 0) ? 1 : -1;
+      wingGeo.translate(sideSign * 2.4, 0, 0.2);
+
+      const wingMesh = new THREE.Group();
+      wingMesh.position.set(wp.x * 0.3, wp.y * 0.3, 0);
+      wingMesh.rotation.z = wp.rotZ;
+      wingMesh.rotation.x = wingAngle;
+      makeHLRPair(wingGeo, wingMesh, {order: 10});
+
+      // Wing-tip cannon
+      const cannonGeo = new THREE.CylinderGeometry(0.1, 0.1, 2.5, 4);
+      cannonGeo.rotateX(Math.PI/2);
+      cannonGeo.translate(sideSign * 4.2, 0, -0.4);
+      makeHLRPair(cannonGeo, wingMesh, {order: 10});
+
+      shipContainer.add(wingMesh);
+    });
+
+    // Engine block at rear
+    const engineGeo = new THREE.CylinderGeometry(0.55, 0.4, 1.0, 6);
+    engineGeo.rotateX(Math.PI/2);
+    engineGeo.translate(0, 0, fLen/2 + 0.5);
+    makeHLRPair(engineGeo, shipContainer, {order: 10});
+
+    // Engine nozzles (2, slight spread)
+    [-0.35, 0.35].forEach(xOff => {
+      const nozGeo = new THREE.CylinderGeometry(0.25, 0.3, 0.6, 5);
+      nozGeo.rotateX(Math.PI/2);
+      nozGeo.translate(xOff, 0, fLen/2 + 1.1);
+      makeHLRPair(nozGeo, shipContainer, {order: 10});
+    });
+
+    return shipContainer;
+  }
+
+  const xfighter = buildXFighter();
+  shipGroup3.add(xfighter);
+
+  // Store references for visibility toggling
+  shipMesh3 = xfighter;   // the whole visual group
+  shipSolid3 = xfighter;  // same ref — we toggle the whole group
+
+  // Thrust flames (two, from nozzles)
+  const flameGroup = new THREE.Group();
+  [-0.35, 0.35].forEach(xOff => {
+    const fGeo = new THREE.ConeGeometry(0.25, 2.2, 4);
+    fGeo.rotateX(-Math.PI / 2);
+    fGeo.translate(xOff, 0, 4.2);
+    const fWire = new THREE.Mesh(fGeo, new THREE.MeshBasicMaterial({
+      color:0x00ffb4, wireframe:true, transparent:true, opacity:0.6, depthWrite:false
+    }));
+    fWire.renderOrder = 12;
+    flameGroup.add(fWire);
+    const fSolid = new THREE.Mesh(fGeo, new THREE.MeshBasicMaterial({
+      color: hlrBgColor, side: THREE.FrontSide, depthWrite:true,
+      polygonOffset:true, polygonOffsetFactor:1, polygonOffsetUnits:1
+    }));
+    fSolid.renderOrder = 11;
+    flameGroup.add(fSolid);
+  });
+  flameGroup.visible = false;
+  thrustFlame3 = flameGroup;
+  thrustFlameSolid3 = flameGroup; // single group controls both
+  shipGroup3.add(flameGroup);
+
+  scene3.add(shipGroup3);
+  shipGroup3.position.set(0, 0, 0);
+  shipVel3 = new THREE.Vector3();
+  shipGroup3.quaternion.identity();
+  shipDead3=false; shipRespawn3=0; shipInvincible3=120;
+  asteroids3=[]; bullets3=[]; particles3d=[];
+  score3=0; lives3=3; level3=0; state3='title'; stateTimer3=0; fireCooldown3=0; camRoll=0;
+  shipSpeed=NORMAL_SPEED; boostTimer=0; boostPhase='normal'; hyperTimer=0;
+  angVelPitch=0; angVelYaw=0; angVelRoll=0;
+}
+
+// ── TIE Fighter geometry builder ──
+function buildTIEFighter() {
+  const group = new THREE.Group();
+
+  // Central cockpit — sphere
+  const cockpitGeo = new THREE.SphereGeometry(1.2, 6, 5);
+  makeHLRPair(cockpitGeo, group, {order: 4});
+
+  // Cockpit window — ring around front
+  const windowGeo = new THREE.TorusGeometry(0.7, 0.08, 4, 8);
+  windowGeo.translate(0, 0, -0.9);
+  makeHLRPair(windowGeo, group, {order: 5});
+
+  // Wing struts — horizontal bars connecting cockpit to wings
+  [-1, 1].forEach(side => {
+    const strutGeo = new THREE.CylinderGeometry(0.12, 0.12, 1.8, 4);
+    strutGeo.rotateZ(Math.PI / 2);
+    strutGeo.translate(side * 2.1, 0, 0);
+    makeHLRPair(strutGeo, group, {order: 4});
+  });
+
+  // Wings — hexagonal flat panels
+  [-1, 1].forEach(side => {
+    const wingShape = new THREE.Shape();
+    const wr = 2.8, ww = 0.1;
+    // Hexagonal wing
+    const pts = [];
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
+      pts.push([Math.cos(a) * ww, Math.sin(a) * wr]);
+    }
+    wingShape.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) wingShape.lineTo(pts[i][0], pts[i][1]);
+    wingShape.closePath();
+
+    const wingGeo = new THREE.ExtrudeGeometry(wingShape, { depth: 0.08, bevelEnabled: false });
+    wingGeo.rotateY(Math.PI / 2);
+    wingGeo.translate(side * 3.0, 0, 0);
+    makeHLRPair(wingGeo, group, {opacity: 0.9, order: 4});
+  });
+
+  return group;
+}
+
+// ── Death Star geometry builder ──
+let deathStar3 = null;
+let deathStarHP = 0;
+let deathStarMaxHP = 0;
+
+function buildDeathStar() {
+  const group = new THREE.Group();
+  const R = 200; // radius 3x bigger (was 18)
+
+  // Main sphere
+  const bodyGeo = new THREE.SphereGeometry(R, 24, 18);
+  makeHLRPair(bodyGeo, group, {opacity: 0.7, order: 2});
+
+  // Equatorial trench — torus
+  const trenchGeo = new THREE.TorusGeometry(R + 0.6, 1.2, 4, 36);
+  trenchGeo.rotateX(Math.PI / 2);
+  makeHLRPair(trenchGeo, group, {order: 3});
+
+  // Visible rim circle at edge (bright, always readable)
+  const rimCircleGeo = new THREE.TorusGeometry(R + 0.3, 0.15, 3, 64);
+  rimCircleGeo.rotateX(Math.PI / 2);
+  const rimCircle = new THREE.Mesh(rimCircleGeo, new THREE.MeshBasicMaterial({
+    color: 0x00ffb4, transparent: true, opacity: 0.5, depthWrite: false, fog: true
+  }));
+  rimCircle.renderOrder = 5;
+  group.add(rimCircle);
+
+  // Second rim circle — vertical
+  const rimCircle2Geo = new THREE.TorusGeometry(R + 0.3, 0.15, 3, 64);
+  const rimCircle2 = new THREE.Mesh(rimCircle2Geo, new THREE.MeshBasicMaterial({
+    color: 0x00ffb4, transparent: true, opacity: 0.3, depthWrite: false, fog: true
+  }));
+  rimCircle2.renderOrder = 5;
+  group.add(rimCircle2);
+
+  // Superlaser dish — concave circle on upper hemisphere
+  const dishGeo = new THREE.SphereGeometry(R * 0.33, 10, 8, 0, Math.PI * 2, 0, Math.PI * 0.45);
+  dishGeo.translate(0, R * 0.55, -R * 0.22);
+  dishGeo.rotateX(-0.5);
+  makeHLRPair(dishGeo, group, {opacity: 0.6, order: 3});
+
+  // Dish rim ring
+  const dishRimGeo = new THREE.TorusGeometry(R * 0.29, 0.5, 4, 16);
+  dishRimGeo.translate(0, R * 0.58, -R * 0.28);
+  dishRimGeo.rotateX(-0.5 + Math.PI / 2);
+  makeHLRPair(dishRimGeo, group, {order: 3});
+
+  // Surface detail lines — meridians
+  for (let i = 0; i < 12; i++) {
+    const curve = new THREE.EllipseCurve(0, 0, R + 0.3, R + 0.3, 0, Math.PI * 2, false, 0);
+    const points = curve.getPoints(48);
+    const pts3 = points.map(p => new THREE.Vector3(p.x, 0, p.y));
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts3);
+    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({
+      color: 0x00ffb4, transparent: true, opacity: 0.06, fog: true
+    }));
+    line.rotation.y = (i / 12) * Math.PI;
+    group.add(line);
+  }
+
+  // Latitude lines
+  for (let i = 1; i < 6; i++) {
+    const lat = (i / 6) * Math.PI - Math.PI/2;
+    const lr = Math.cos(lat) * (R + 0.3);
+    const ly = Math.sin(lat) * (R + 0.3);
+    const latGeo = new THREE.TorusGeometry(lr, 0.1, 3, 32);
+    latGeo.rotateX(Math.PI / 2);
+    latGeo.translate(0, ly, 0);
+    const latLine = new THREE.Mesh(latGeo, new THREE.MeshBasicMaterial({
+      color: 0x00ffb4, transparent: true, opacity: 0.05, depthWrite: false, fog: true
+    }));
+    group.add(latLine);
+  }
+
+  return group;
+}
+
+function spawnTIE(pos) {
+  const group = buildTIEFighter();
+  const r = 3.5;
+  group.position.copy(pos || new THREE.Vector3(
+    (Math.random()-0.5)*CUBE*0.6,
+    (Math.random()-0.5)*CUBE*0.6,
+    (Math.random()-0.5)*CUBE*0.6
+  ));
+  // Random initial facing
+  group.quaternion.setFromEuler(new THREE.Euler(
+    Math.random()*Math.PI*2, Math.random()*Math.PI*2, 0
+  ));
+
+  const vel = new THREE.Vector3(0, 0, -0.15); // will be updated by AI
+  scene3.add(group);
+  asteroids3.push({
+    group, r, size: 3, vel, isTIE: true,
+    rotAxis: new THREE.Vector3(0,1,0), rotSpd: 0,
+    hp: 2, fireCooldown: 60 + Math.floor(Math.random() * 120),
+    aiState: 'patrol', aiTimer: 0
+  });
+}
+
+function spawnWave3() {
+  level3++;
+  const count = 30 + level3 * 6;
+  for (let i = 0; i < count; i++) {
+    let p; do {
+      p = new THREE.Vector3(
+        (Math.random()-0.5)*CUBE*0.6,
+        (Math.random()-0.5)*CUBE*0.6,
+        (Math.random()-0.5)*CUBE*0.6
+      );
+    } while (p.distanceTo(shipGroup3.position) < 500);
+    spawnTIE(p);
+  }
+
+  // Spawn Death Star on level 1 if not present
+  if (!deathStar3) {
+    deathStar3 = buildDeathStar();
+    deathStar3.position.set(
+      (Math.random()-0.5)*CUBE*0.6,
+      (Math.random()-0.5)*CUBE*0.6,
+      (Math.random()-0.5)*CUBE*0.6
+    );
+    scene3.add(deathStar3);
+    deathStarMaxHP = 20;
+    deathStarHP = deathStarMaxHP;
+  }
+}
+
+// ── Enemy bullets (TIE lasers) ──
+let enemyBullets3 = [];
+
+function spawnTIELaser(pos, dir) {
+  const bm = new THREE.Mesh(
+    new THREE.SphereGeometry(0.25, 4, 4),
+    new THREE.MeshBasicMaterial({color: 0xff3333, fog: true, depthWrite: false, transparent: true, opacity: 0.9})
+  );
+  bm.renderOrder = 20;
+  bm.position.copy(pos);
+  const bv = dir.clone().multiplyScalar(4.5);
+  scene3.add(bm);
+  enemyBullets3.push({mesh: bm, vel: bv, life: 120});
+}
+
+function spawnPar3D(pos, c, sp) {
+  for (let i = 0; i < c; i++) {
+    const geo = new THREE.SphereGeometry(0.2, 3, 3);
+    const mat = new THREE.MeshBasicMaterial({color:0x00ffb4, transparent:true, opacity:1, fog:true, depthWrite:false});
+    const m = new THREE.Mesh(geo, mat);
+    m.position.copy(pos);
+    m.renderOrder = 20;
+    const v = new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).normalize().multiplyScalar(sp*Math.random());
+    scene3.add(m);
+    particles3d.push({mesh:m, vel:v, life:30+Math.random()*20, maxLife:50});
+  }
+}
+
+// Red explosion for TIEs
+function spawnRedExplosion(pos, c, sp) {
+  for (let i = 0; i < c; i++) {
+    const geo = new THREE.SphereGeometry(0.25, 3, 3);
+    const mat = new THREE.MeshBasicMaterial({color: 0xff4444, transparent:true, opacity:1, fog:true, depthWrite:false});
+    const m = new THREE.Mesh(geo, mat);
+    m.position.copy(pos);
+    m.renderOrder = 20;
+    const v = new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).normalize().multiplyScalar(sp*Math.random());
+    scene3.add(m);
+    particles3d.push({mesh:m, vel:v, life:25+Math.random()*20, maxLife:45});
+  }
+}
+
+// ── Toroidal wrap: wraps any position relative to a reference (camera/ship) ──
+function toroidalWrap(pos) {
+  ['x','y','z'].forEach(ax => {
+    while (pos[ax] < -HALF) pos[ax] += CUBE;
+    while (pos[ax] >  HALF) pos[ax] -= CUBE;
+  });
+}
+
+// Wrap objects relative to camera so nearby things stay visible across boundaries
+function toroidalWrapRelative(objPos, refPos) {
+  ['x','y','z'].forEach(ax => {
+    while (objPos[ax] - refPos[ax] > HALF) objPos[ax] -= CUBE;
+    while (objPos[ax] - refPos[ax] < -HALF) objPos[ax] += CUBE;
+  });
+}
+
+function update3D() {
+  stateTimer3++;
+  const camRef = shipDead3 ? camera3.position : shipGroup3.position;
+
+  if (state3 === 'title') {
+    if (isKey('fire')||isKey('thrust')) {
+      // Clear title screen TIEs
+      asteroids3.forEach(a => scene3.remove(a.group));
+      asteroids3 = [];
+      state3='playing'; stateTimer3=0; shipInvincible3=120; spawnWave3(); playStartJingle();
+    }
+    // Float TIEs gently on title screen
+    if (asteroids3.length === 0) {
+      for (let i = 0; i < 4; i++) {
+        spawnTIE(new THREE.Vector3((Math.random()-0.5)*80, (Math.random()-0.5)*80, (Math.random()-0.5)*80 - 30));
+      }
+    }
+    asteroids3.forEach(a => {
+      a.group.position.add(a.vel.clone().multiplyScalar(0.3));
+      a.group.rotation.y += 0.005;
+      toroidalWrap(a.group.position);
+      toroidalWrapRelative(a.group.position, camRef);
+    });
+    return;
+  }
+  if (state3 === 'gameover') {
+    asteroids3.forEach(a => {
+      a.group.position.add(a.vel.clone().multiplyScalar(0.3));
+      a.group.rotation.y += 0.005;
+      toroidalWrap(a.group.position);
+      toroidalWrapRelative(a.group.position, camRef);
+    });
+    // Clean enemy bullets
+    enemyBullets3.forEach(b => { b.mesh.position.add(b.vel); b.life--; });
+    enemyBullets3 = enemyBullets3.filter(b => { if(b.life<=0){scene3.remove(b.mesh);return false;} return true; });
+    particles3d.forEach(p => { p.mesh.position.add(p.vel); p.vel.multiplyScalar(0.96); p.life--; p.mesh.material.opacity=p.life/p.maxLife; });
+    particles3d = particles3d.filter(p => { if(p.life<=0){scene3.remove(p.mesh);return false;} return true; });
+    if (stateTimer3>90 && isKey('fire')) { goToMenu(); }
+    return;
+  }
+
+  // ── PLAYING ──
+  if (!shipDead3) {
+    // ── Flight controls: Stick Y = Pitch, Stick X = Yaw (rudder) ──
+    let pitchInput = 0, yawInput = 0;
+
+    // Gamepad stick
+    yawInput   = gpState.stickLX;
+    pitchInput = gpState.stickLY;
+
+    // Keyboard
+    if (keys['ArrowLeft']||keys['KeyA'])  yawInput = -1;
+    if (keys['ArrowRight']||keys['KeyD']) yawInput =  1;
+    if (keys['ArrowUp']||keys['KeyW'])    pitchInput = -1;
+    if (keys['ArrowDown']||keys['KeyS'])  pitchInput =  1;
+
+    // Both pitch and yaw are DIRECT — proportional to stick, no inertia
+    const pitchSpeed = pitchInput * 0.012;
+    const yawSpeed = yawInput * -0.012;
+
+    // Apply pitch and yaw to the ship
+    shipGroup3.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), pitchSpeed));
+    shipGroup3.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yawSpeed));
+
+    // Cosmetic bank on ship visual (tilt into the turn)
+    const maxBankAngle = Math.PI * 0.17;
+    const targetBank = -yawInput * maxBankAngle;
+    const shipVisual = shipGroup3.children[0];
+    if (shipVisual) {
+      if (!shipVisual._cosmeticRoll) shipVisual._cosmeticRoll = 0;
+      shipVisual._cosmeticRoll += (targetBank - shipVisual._cosmeticRoll) * 0.08;
+      if (Math.abs(yawInput) < 0.1) shipVisual._cosmeticRoll *= 0.9;
+      shipVisual.rotation.z = shipVisual._cosmeticRoll;
+    }
+
+    // Camera cosmetic roll follows yaw input
+    const maxCamRoll = Math.PI * 0.12;
+    const targetCamRoll = -yawInput * maxCamRoll;
+    camRoll += (targetCamRoll - camRoll) * 0.06;
+    if (Math.abs(yawInput) < 0.1) camRoll *= 0.9;
+
+    const thr = isKey('thrust');
+
+    // ── Speed system: always moving forward ──
+    if (boostPhase === 'normal') {
+      if (thr) {
+        boostPhase = 'boosting';
+        boostTimer = 0;
+        if (!thrustAudioOn) { sfxThrustOn(); thrustAudioOn=true; }
+      }
+      shipSpeed += (NORMAL_SPEED - shipSpeed) * 0.05; // ease back to normal
+    } else if (boostPhase === 'boosting') {
+      boostTimer++;
+      // Accelerate from normal to max boost over BOOST_TIME frames
+      const t = Math.min(boostTimer / BOOST_TIME, 1);
+      shipSpeed = NORMAL_SPEED + (MAX_BOOST_SPEED - NORMAL_SPEED) * t;
+
+      if (boostTimer >= BOOST_TIME) {
+        // Enter hyperspace!
+        boostPhase = 'hyper';
+        hyperTimer = HYPER_DURATION;
+        shipSpeed = HYPER_SPEED;
+      }
+      if (!thr) {
+        // Released trigger — abort boost, return to normal
+        boostPhase = 'normal';
+        if (thrustAudioOn) { sfxThrustOff(); thrustAudioOn=false; }
+      }
+    } else if (boostPhase === 'hyper') {
+      hyperTimer--;
+      shipSpeed = HYPER_SPEED;
+      if (hyperTimer <= 0) {
+        boostPhase = 'normal';
+        boostTimer = 0;
+        if (thrustAudioOn) { sfxThrustOff(); thrustAudioOn=false; }
+      }
+    }
+
+    // Always move forward
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(shipGroup3.quaternion);
+    shipVel3.copy(fwd.multiplyScalar(shipSpeed));
+    shipGroup3.position.add(shipVel3);
+    toroidalWrap(shipGroup3.position);
+
+    // Thrust flames — always visible, scale with speed
+    thrustFlame3.visible = true;
+    const flameScale = 0.4 + (shipSpeed / HYPER_SPEED) * 2.5;
+    const flameFlicker = (boostPhase === 'hyper') ? 0.5 + Math.random() * 1.5 : 0.8 + Math.random() * 0.4;
+    thrustFlame3.children.forEach(c => c.scale.set(
+      1 + (shipSpeed > 1 ? 0.3 : 0),
+      1 + (shipSpeed > 1 ? 0.3 : 0),
+      flameScale * flameFlicker
+    ));
+
+    // Star lines effect — stretch with speed
+    if (starLinesMesh) {
+      const boostFactor = Math.max(0, (shipSpeed - NORMAL_SPEED) / (HYPER_SPEED - NORMAL_SPEED));
+      starLinesMesh.material.opacity = boostFactor * 0.7;
+      starLinesMesh.position.copy(shipGroup3.position);
+      starLinesMesh.quaternion.copy(shipGroup3.quaternion);
+
+      // Stretch the lines based on speed
+      const posArr = starLinesMesh.geometry.attributes.position.array;
+      const lineCount = posArr.length / 6;
+      for (let i = 0; i < lineCount; i++) {
+        // End point stretches backward
+        const stretch = boostFactor * (40 + (boostPhase === 'hyper' ? 120 : 0));
+        posArr[i*6+5] = posArr[i*6+2] + stretch;
+      }
+      starLinesMesh.geometry.attributes.position.needsUpdate = true;
+    }
+
+    // FOV effect — widens with speed
+    const targetFOV = baseFOV + (shipSpeed - NORMAL_SPEED) / (HYPER_SPEED - NORMAL_SPEED) * 35;
+    camera3.fov += (targetFOV - camera3.fov) * 0.08;
+    camera3.updateProjectionMatrix();
+
+    if (shipInvincible3>0) {
+      shipInvincible3--;
+      const vis = (Math.floor(shipInvincible3/3)%2===0);
+      shipMesh3.visible = vis;
+    } else {
+      shipMesh3.visible = true;
+    }
+
+    fireCooldown3--;
+    if (isKey('fire') && fireCooldown3<=0) {
+      const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(shipGroup3.quaternion);
+      const bm = new THREE.Mesh(
+        new THREE.SphereGeometry(0.35, 5, 5),
+        new THREE.MeshBasicMaterial({color:0x00ffb4, fog:true, depthWrite:false})
+      );
+      bm.renderOrder = 20;
+      bm.position.copy(shipGroup3.position).add(fwd.clone().multiplyScalar(7));
+      const bv = fwd.clone().multiplyScalar(6.0).add(shipVel3.clone().multiplyScalar(0.3));
+      scene3.add(bm);
+      bullets3.push({mesh:bm, vel:bv, life:150});
+      fireCooldown3=8; sfxShoot();
+    }
+  } else {
+    shipRespawn3--;
+    if (shipRespawn3<=0) {
+      shipDead3=false; shipGroup3.position.set(0,0,0); shipVel3.set(0,0,0);
+      shipGroup3.quaternion.identity(); shipInvincible3=120;
+      shipMesh3.visible=true; scene3.add(shipGroup3);
+      shipSpeed=NORMAL_SPEED; boostPhase='normal'; boostTimer=0; hyperTimer=0;
+      angVelPitch=0; angVelYaw=0; angVelRoll=0; camRoll=0;
+      // Reset cosmetic bank on ship visual
+      const sv = shipGroup3.children[0];
+      if (sv) { sv.rotation.z = 0; sv._cosmeticRoll = 0; }
+    }
+  }
+
+  // Bullets
+  bullets3.forEach(b => { b.mesh.position.add(b.vel); b.life--; toroidalWrap(b.mesh.position); });
+  bullets3 = bullets3.filter(b => {
+    if (b.life<=0) { scene3.remove(b.mesh); return false; }
+    toroidalWrapRelative(b.mesh.position, camRef);
+    return true;
+  });
+
+  // Enemy bullets
+  enemyBullets3.forEach(b => { b.mesh.position.add(b.vel); b.life--; });
+  enemyBullets3 = enemyBullets3.filter(b => {
+    if (b.life<=0) { scene3.remove(b.mesh); return false; }
+    return true;
+  });
+
+  // TIE Fighter AI + movement
+  const shipPos = shipDead3 ? new THREE.Vector3(0,0,0) : shipGroup3.position;
+  asteroids3.forEach(a => {
+    if (a.isTIE && state3 === 'playing') {
+      a.aiTimer++;
+      const toPlayer = shipPos.clone().sub(a.group.position);
+      const dist = toPlayer.length();
+
+      // Face towards player (slerp)
+      if (dist > 5 && !shipDead3) {
+        const targetQuat = new THREE.Quaternion();
+        const lookMat = new THREE.Matrix4().lookAt(
+          a.group.position, shipPos, new THREE.Vector3(0,1,0)
+        );
+        targetQuat.setFromRotationMatrix(lookMat);
+        a.group.quaternion.slerp(targetQuat, 0.02);
+      }
+
+      // Movement — fly towards player, with some weaving
+      const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(a.group.quaternion);
+      const weave = Math.sin(a.aiTimer * 0.03) * 0.2;
+      const side = new THREE.Vector3(1, 0, 0).applyQuaternion(a.group.quaternion);
+      a.vel.copy(fwd.multiplyScalar(4 + level3 * 0.15)).add(side.multiplyScalar(weave));
+
+      // Keep some distance — if too close, veer off
+      if (dist < 120) {
+        const away = a.group.position.clone().sub(shipPos).normalize().multiplyScalar(0.6);
+        a.vel.add(away);
+      }
+
+      // Fire at player
+      a.fireCooldown--;
+      if (a.fireCooldown <= 0 && dist < 1500 && !shipDead3) {
+        const fireDir = shipPos.clone().sub(a.group.position).normalize();
+        spawnTIELaser(a.group.position.clone().add(fireDir.clone().multiplyScalar(5)), fireDir);
+        a.fireCooldown = 80 + Math.floor(Math.random() * 80) - level3 * 5;
+        if (a.fireCooldown < 30) a.fireCooldown = 30;
+      }
+    }
+
+    a.group.position.add(a.vel);
+    if (!a.isTIE) a.group.rotateOnAxis(a.rotAxis, a.rotSpd);
+    toroidalWrap(a.group.position);
+    toroidalWrapRelative(a.group.position, camRef);
+  });
+
+  // Death Star slow rotation
+  if (deathStar3) {
+    deathStar3.rotation.y += 0.004; deathStar3.rotation.x += 0.001;
+    toroidalWrapRelative(deathStar3.position, camRef);
+  }
+
+  // Bullet-TIE collision
+  for (let i=bullets3.length-1; i>=0; i--) {
+    for (let j=asteroids3.length-1; j>=0; j--) {
+      if (bullets3[i].mesh.position.distanceTo(asteroids3[j].group.position) < asteroids3[j].r+0.6) {
+        const a=asteroids3[j], pos=a.group.position.clone();
+        if (a.isTIE) {
+          a.hp--;
+          if (a.hp <= 0) {
+            spawnRedExplosion(pos, 15, 0.3);
+            sfxShipExplode();
+            score3 += 100;
+            scene3.remove(a.group); asteroids3.splice(j,1);
+          } else {
+            spawnPar3D(pos, 5, 0.15);
+            sfxAsteroidExplode(1);
+            score3 += 25;
+          }
+        } else {
+          spawnPar3D(pos, 8, 0.25);
+          sfxAsteroidExplode(a.size);
+          score3 += 50;
+          scene3.remove(a.group); asteroids3.splice(j,1);
+        }
+        scene3.remove(bullets3[i].mesh); bullets3.splice(i,1); break;
+      }
+    }
+  }
+
+  // Bullet-DeathStar collision
+  if (deathStar3) {
+    for (let i=bullets3.length-1; i>=0; i--) {
+      if (bullets3[i].mesh.position.distanceTo(deathStar3.position) < 204) {
+        spawnPar3D(bullets3[i].mesh.position.clone(), 4, 0.15);
+        deathStarHP--;
+        score3 += 10;
+        scene3.remove(bullets3[i].mesh); bullets3.splice(i,1);
+
+        // Death Star destroyed!
+        if (deathStarHP <= 0) {
+          spawnRedExplosion(deathStar3.position.clone(), 60, 0.8);
+          spawnPar3D(deathStar3.position.clone(), 40, 0.6);
+          sfxShipExplode();
+          score3 += 1000;
+          scene3.remove(deathStar3);
+          deathStar3 = null;
+          // Remove all TIEs
+          asteroids3.forEach(a => scene3.remove(a.group));
+          asteroids3 = [];
+        }
+      }
+    }
+  }
+
+  // Enemy bullet-Player collision
+  if (!shipDead3 && shipInvincible3<=0) {
+    for (let i=enemyBullets3.length-1; i>=0; i--) {
+      if (enemyBullets3[i].mesh.position.distanceTo(shipGroup3.position) < 3) {
+        spawnPar3D(shipGroup3.position.clone(), 20, 0.3);
+        sfxShipExplode();
+        killThrust();
+        shipDead3=true; lives3--; scene3.remove(shipGroup3);
+        scene3.remove(enemyBullets3[i].mesh); enemyBullets3.splice(i,1);
+        if (lives3<=0) { state3='gameover'; stateTimer3=0; playGameOverJingle(); }
+        else shipRespawn3=120;
+        break;
+      }
+    }
+  }
+
+  // Ship-TIE collision
+  if (!shipDead3 && shipInvincible3<=0) {
+    for (let j=asteroids3.length-1; j>=0; j--) {
+      if (shipGroup3.position.distanceTo(asteroids3[j].group.position) < asteroids3[j].r+2.5) {
+        spawnRedExplosion(shipGroup3.position.clone(), 20, 0.3);
+        spawnRedExplosion(asteroids3[j].group.position.clone(), 15, 0.3);
+        sfxShipExplode();
+        killThrust();
+        shipDead3=true; lives3--;
+        scene3.remove(shipGroup3);
+        scene3.remove(asteroids3[j].group); asteroids3.splice(j,1);
+        if (lives3<=0) { state3='gameover'; stateTimer3=0; playGameOverJingle(); }
+        else shipRespawn3=120;
+        break;
+      }
+    }
+  }
+
+  // Ship-DeathStar collision
+  if (!shipDead3 && deathStar3 && shipGroup3.position.distanceTo(deathStar3.position) < 206) {
+    spawnRedExplosion(shipGroup3.position.clone(), 30, 0.4);
+    sfxShipExplode();
+    killThrust();
+    shipDead3=true; lives3--; scene3.remove(shipGroup3);
+    if (lives3<=0) { state3='gameover'; stateTimer3=0; playGameOverJingle(); }
+    else shipRespawn3=120;
+  }
+
+  // Particles
+  particles3d.forEach(p => { p.mesh.position.add(p.vel); p.vel.multiplyScalar(0.96); p.life--; p.mesh.material.opacity=Math.max(0,p.life/p.maxLife); });
+  particles3d = particles3d.filter(p => { if(p.life<=0){scene3.remove(p.mesh);return false;} return true; });
+
+  // Next wave — when all TIEs destroyed (Death Star may still be alive)
+  if (asteroids3.length===0 && state3==='playing') {
+    if (deathStar3) {
+      // More TIEs spawn to defend
+      spawnWave3();
+    } else {
+      // Death Star destroyed + all TIEs gone = victory / next level
+      // Reset Death Star for next round
+      spawnWave3();
+    }
+  }
+
+  // Camera follow — locked behind ship, tight
+  if (!shipDead3) {
+    const behind = new THREE.Vector3(0, 2.5, 18).applyQuaternion(shipGroup3.quaternion);
+    const desiredPos = shipGroup3.position.clone().add(behind);
+
+    // Detect toroidal wrap: if camera is too far from desired pos, snap instantly
+    const camDist = camera3.position.distanceTo(desiredPos);
+    if (camDist > 100) {
+      // Ship wrapped — teleport camera
+      camera3.position.copy(desiredPos);
+      camLerpTarget.copy(shipGroup3.position.clone().add(
+        new THREE.Vector3(0, 0, -50).applyQuaternion(shipGroup3.quaternion)
+      ));
+    } else {
+      camera3.position.lerp(desiredPos, 0.18);
+    }
+
+    const lookTarget = shipGroup3.position.clone().add(
+      new THREE.Vector3(0, 0, -50).applyQuaternion(shipGroup3.quaternion)
+    );
+    camLerpTarget.lerp(lookTarget, 0.18);
+    camera3.lookAt(camLerpTarget);
+
+    // Apply cosmetic roll — rotate camera around its forward axis
+    const camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera3.quaternion);
+    camera3.quaternion.multiply(
+      new THREE.Quaternion().setFromAxisAngle(camFwd.normalize(), camRoll)
+    );
+  } else {
+    // When dead, spring back
+    camRoll *= 0.95;
+    angVelPitch *= 0.9; angVelYaw *= 0.9; angVelRoll = 0;
+    shipSpeed = NORMAL_SPEED; boostPhase = 'normal'; boostTimer = 0; hyperTimer = 0;
+    if (starLinesMesh) starLinesMesh.material.opacity = 0;
+    camera3.fov += (baseFOV - camera3.fov) * 0.05;
+    camera3.updateProjectionMatrix();
+  }
+
+  // Move starfield with camera (parallax illusion)
+  if (starField) {
+    starField.position.copy(camera3.position);
+  }
+}
+
+function render3D(){
+  renderer3.render(scene3,camera3);
+
+  // HUD overlay
+  ctx.clearRect(0,0,W,H);
+  if(state3==='title'){
+    setGlow(1,20);ctx.fillStyle=GLOW;ctx.textAlign='center';
+    ctx.font='48px "Share Tech Mono",monospace';ctx.fillText('TRENCH RUN',W/2,H/2-60);
+    setGlow(0.6,10);ctx.font='14px "Share Tech Mono",monospace';ctx.fillText('— DESTROY THE DEATH STAR —',W/2,H/2-20);
+    if(Math.sin(Date.now()*0.005)>0){setGlow(0.8,10);ctx.font='18px "Share Tech Mono",monospace';ctx.fillText('PRESS SPACE TO START',W/2,H/2+50);}
+    setGlow(0.35,4);ctx.font='11px "Share Tech Mono",monospace';
+    ctx.fillText('STICK/WS PITCH · STICK/AD RUDDER',W/2,H/2+100);
+    ctx.fillText('LT BOOST → HYPERSPACE · ESPACIO/RT DISPARAR',W/2,H/2+118);
+  }else if(state3==='gameover'){
+    setGlow(1,20);ctx.fillStyle=GLOW;ctx.textAlign='center';ctx.font='48px "Share Tech Mono",monospace';ctx.fillText('GAME OVER',W/2,H/2-30);
+    setGlow(0.7,8);ctx.font='22px "Share Tech Mono",monospace';ctx.fillText('SCORE: '+score3,W/2,H/2+20);
+    if(stateTimer3>90){const p=0.45+Math.sin(Date.now()*0.004)*0.35;setGlow(p,8+p*4);ctx.font='16px "Share Tech Mono",monospace';ctx.fillText('PRESS SPACE TO CONTINUE',W/2,H/2+70);}
+  }else{
+    // Score
+    setGlow(0.9,6);ctx.font='22px "Share Tech Mono",monospace';ctx.fillStyle=GLOW;ctx.textAlign='left';
+    ctx.fillText(String(score3).padStart(6,'0'),25,40);
+    // Lives
+    for(let i=0;i<lives3;i++){ctx.save();ctx.translate(35+i*28,65);ctx.rotate(-Math.PI/2);ctx.scale(0.6,0.6);setGlow(0.7,4);drawPoly([{x:18,y:0},{x:-12,y:-10},{x:-7,y:0},{x:-12,y:10}],true);ctx.restore();}
+    // Wave
+    ctx.textAlign='right';ctx.fillStyle=GLOW;ctx.globalAlpha=0.5;ctx.font='14px "Share Tech Mono",monospace';ctx.fillText('WAVE '+level3,W-25,40);ctx.globalAlpha=1;
+
+    // TIE count
+    setGlow(0.6,4);ctx.font='13px "Share Tech Mono",monospace';ctx.textAlign='right';
+    ctx.fillText('TIES: '+asteroids3.length, W-25, 60);
+
+    // Speed / Boost bar (left side)
+    const sBarX = 25, sBarY = H - 60, sBarW = 120, sBarH = 8;
+    const speedPct = Math.min(1, (shipSpeed - NORMAL_SPEED) / (HYPER_SPEED - NORMAL_SPEED));
+    const boostPct = boostTimer / BOOST_TIME;
+    setGlow(0.4, 4); ctx.strokeStyle = GLOW; ctx.lineWidth = 1;
+    ctx.strokeRect(sBarX, sBarY, sBarW, sBarH);
+    if (boostPhase === 'hyper') {
+      // Flashing bar at hyper
+      ctx.fillStyle = (Math.floor(Date.now()/80) % 2) ? '#00ffb4' : '#ffffff';
+      ctx.globalAlpha = 0.9;
+      ctx.fillRect(sBarX+1, sBarY+1, sBarW-2, sBarH-2);
+    } else {
+      ctx.fillStyle = boostPct > 0.8 ? '#ffaa00' : GLOW;
+      ctx.globalAlpha = 0.6;
+      ctx.fillRect(sBarX+1, sBarY+1, (sBarW-2) * boostPct, sBarH-2);
+    }
+    ctx.globalAlpha = 1;
+    setGlow(0.5, 3); ctx.font='10px "Share Tech Mono",monospace'; ctx.textAlign='left'; ctx.fillStyle=GLOW;
+    const speedLabel = boostPhase === 'hyper' ? 'HYPERSPACE' : boostPhase === 'boosting' ? 'BOOST' : 'SPEED';
+    ctx.fillText(speedLabel, sBarX, sBarY - 4);
+
+    // Death Star HP bar
+    if (deathStar3 && deathStarMaxHP > 0) {
+      const barW = 200, barH = 10, barX = W/2 - barW/2, barY = H - 35;
+      const pct = deathStarHP / deathStarMaxHP;
+      setGlow(0.4, 4);
+      ctx.strokeStyle = GLOW; ctx.lineWidth = 1;
+      ctx.strokeRect(barX, barY, barW, barH);
+      // Fill
+      const fillColor = pct > 0.5 ? GLOW : pct > 0.25 ? '#ffaa00' : '#ff3333';
+      ctx.fillStyle = fillColor;
+      ctx.globalAlpha = 0.7;
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * pct, barH - 2);
+      ctx.globalAlpha = 1;
+      // Label
+      setGlow(0.5, 4);ctx.font='10px "Share Tech Mono",monospace';ctx.textAlign='center';
+      ctx.fillStyle = GLOW;
+      ctx.fillText('DEATH STAR', W/2, barY - 4);
+    } else if (!deathStar3) {
+      setGlow(0.8, 8);ctx.font='14px "Share Tech Mono",monospace';ctx.textAlign='center';ctx.fillStyle=GLOW;
+      const blink = Math.sin(Date.now()*0.006) > 0;
+      if (blink) ctx.fillText('★ DEATH STAR DESTROYED ★', W/2, H - 30);
+    }
+
+    // ── FORWARD RADAR — only shows what's ahead ──
+    const radarX = W - 100, radarY = H - 110, radarR = 45;
+
+    ctx.save();
+    ctx.translate(radarX, radarY);
+
+    const invQ = shipDead3 ? new THREE.Quaternion() : shipGroup3.quaternion.clone().invert();
+
+    function radarProjectFwd(worldPos) {
+      const ref = shipDead3 ? new THREE.Vector3(0,0,0) : shipGroup3.position;
+      const rel = worldPos.clone().sub(ref);
+      ['x','y','z'].forEach(ax => {
+        while (rel[ax] > HALF) rel[ax] -= CUBE;
+        while (rel[ax] < -HALF) rel[ax] += CUBE;
+      });
+      rel.applyQuaternion(invQ);
+      // In ship local space: -Z is forward, X is right, Y is up
+      const dist = rel.length();
+      const normDist = dist / HALF;
+      // Only show if in front (negative Z in local space)
+      const inFront = rel.z < 0;
+      // Project onto XY plane, scaled by angle from forward
+      const fwdDist = -rel.z;
+      const angFromFwd = Math.atan2(Math.sqrt(rel.x*rel.x + rel.y*rel.y), fwdDist);
+      const maxAng = Math.PI * 0.8; // ~144° cone
+      if (angFromFwd > maxAng) return null;
+      // Radial position in radar: 0 = center (dead ahead), 1 = edge
+      const radialPos = angFromFwd / maxAng;
+      // Angle in the radar circle
+      const screenAng = Math.atan2(-rel.x, -rel.y); // X→right, Y→up on screen
+      const px = Math.sin(screenAng) * radialPos * radarR;
+      const py = -Math.cos(screenAng) * radialPos * radarR;
+      return { x: px, y: py, dist: normDist, inFront };
+    }
+
+    // Radar circle outline
+    setGlow(0.35, 4); ctx.strokeStyle = GLOW; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(0, 0, radarR, 0, Math.PI * 2); ctx.stroke();
+    // Inner ring (half range)
+    ctx.globalAlpha = 0.15;
+    ctx.beginPath(); ctx.arc(0, 0, radarR * 0.5, 0, Math.PI * 2); ctx.stroke();
+    // Crosshair lines
+    ctx.globalAlpha = 0.12;
+    ctx.beginPath(); ctx.moveTo(-radarR, 0); ctx.lineTo(radarR, 0); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, -radarR); ctx.lineTo(0, radarR); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Center dot (you)
+    setGlow(0.9, 5); ctx.fillStyle = GLOW;
+    ctx.beginPath(); ctx.arc(0, 0, 2, 0, Math.PI * 2); ctx.fill();
+
+    // TIE fighters — red dots
+    asteroids3.forEach(a => {
+      const p = radarProjectFwd(a.group.position);
+      if (!p) return;
+      const alpha = Math.max(0.3, 1 - p.dist * 0.5);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = '#ff4444';
+      ctx.shadowColor = '#ff4444';
+      ctx.shadowBlur = 4;
+      const dotSize = Math.max(1.5, 3 - p.dist * 1.5);
+      ctx.beginPath(); ctx.arc(p.x, p.y, dotSize, 0, Math.PI * 2); ctx.fill();
+    });
+
+    // Death Star — white fat dot
+    if (deathStar3) {
+      const p = radarProjectFwd(deathStar3.position);
+      if (p) {
+        const alpha = Math.max(0.5, 1 - p.dist * 0.3);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 8;
+        const dotSize = Math.max(3.5, 5.5 - p.dist * 2);
+        ctx.beginPath(); ctx.arc(p.x, p.y, dotSize, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = alpha * 0.4;
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.arc(p.x, p.y, dotSize + 3, 0, Math.PI * 2); ctx.stroke();
+      } else {
+        // Death Star is behind — show arrow at edge pointing back
+        const ref = shipDead3 ? new THREE.Vector3(0,0,0) : shipGroup3.position;
+        const rel = deathStar3.position.clone().sub(ref);
+        ['x','y','z'].forEach(ax => { while(rel[ax]>HALF)rel[ax]-=CUBE; while(rel[ax]<-HALF)rel[ax]+=CUBE; });
+        rel.applyQuaternion(invQ);
+        const ang = Math.atan2(-rel.x, -rel.y);
+        const ex = Math.sin(ang) * (radarR - 4);
+        const ey = -Math.cos(ang) * (radarR - 4);
+        ctx.globalAlpha = 0.6;
+        ctx.fillStyle = '#ffffff'; ctx.shadowColor = '#ffffff'; ctx.shadowBlur = 4;
+        ctx.beginPath(); ctx.arc(ex, ey, 3, 0, Math.PI * 2); ctx.fill();
+        // Small chevron
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.2;
+        const chevAng = ang;
+        ctx.beginPath();
+        ctx.moveTo(ex + Math.sin(chevAng-0.4)*6, ey - Math.cos(chevAng-0.4)*6);
+        ctx.lineTo(ex + Math.sin(chevAng)*9, ey - Math.cos(chevAng)*9);
+        ctx.lineTo(ex + Math.sin(chevAng+0.4)*6, ey - Math.cos(chevAng+0.4)*6);
+        ctx.stroke();
+      }
+    }
+
+    // Label
+    ctx.globalAlpha = 0.4; ctx.shadowBlur = 0;
+    ctx.fillStyle = GLOW;
+    ctx.font = '9px "Share Tech Mono",monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('RADAR', 0, radarR + 14);
+
+    ctx.restore();
+    ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+
+    // ── Death Star TARGET RETICLE — projected on screen ──
+    if (deathStar3 && !shipDead3) {
+      const dsPos = deathStar3.position.clone();
+      toroidalWrapRelative(dsPos, shipGroup3.position);
+      const dsScreen = dsPos.clone().project(camera3);
+      const sx = (dsScreen.x * 0.5 + 0.5) * W;
+      const sy = (-dsScreen.y * 0.5 + 0.5) * H;
+      const isInFront = dsScreen.z < 1;
+
+      if (isInFront && sx > -50 && sx < W+50 && sy > -50 && sy < H+50) {
+        const dsDist = shipGroup3.position.distanceTo(dsPos);
+        const targetSize = Math.max(18, Math.min(80, 8000 / dsDist));
+        const pulse = 1 + Math.sin(Date.now() * 0.004) * 0.15;
+
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.rotate(Date.now() * 0.001);
+        setGlow(0.5, 8); ctx.strokeStyle = '#ff4444'; ctx.shadowColor = '#ff4444'; ctx.lineWidth = 1.5;
+        const s = targetSize * pulse;
+        ctx.beginPath(); ctx.moveTo(0,-s); ctx.lineTo(s,0); ctx.lineTo(0,s); ctx.lineTo(-s,0); ctx.closePath(); ctx.stroke();
+
+        ctx.rotate(-Date.now() * 0.001);
+        const b = s * 0.6;
+        ctx.strokeStyle = '#ff6666'; ctx.shadowColor = '#ff6666'; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(-b,-b+6); ctx.lineTo(-b,-b); ctx.lineTo(-b+6,-b); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(b,-b+6); ctx.lineTo(b,-b); ctx.lineTo(b-6,-b); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-b,b-6); ctx.lineTo(-b,b); ctx.lineTo(-b+6,b); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(b,b-6); ctx.lineTo(b,b); ctx.lineTo(b-6,b); ctx.stroke();
+
+        ctx.globalAlpha = 0.6; ctx.shadowBlur = 2;
+        ctx.fillStyle = '#ff6666'; ctx.font = '10px "Share Tech Mono",monospace'; ctx.textAlign = 'center';
+        ctx.fillText(Math.floor(dsDist) + 'm', 0, s + 14);
+        ctx.fillText('TARGET', 0, -s - 6);
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    }
+
+    // Crosshair
+    setGlow(0.35,6);ctx.strokeStyle=GLOW;
+    ctx.beginPath();ctx.arc(W/2,H/2,14,0,Math.PI*2);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(W/2-22,H/2);ctx.lineTo(W/2-10,H/2);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(W/2+10,H/2);ctx.lineTo(W/2+22,H/2);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(W/2,H/2-22);ctx.lineTo(W/2,H/2-10);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(W/2,H/2+10);ctx.lineTo(W/2,H/2+22);ctx.stroke();
+    if(gamepadConnected){ctx.save();setGlow(0.4,4);ctx.font='11px "Share Tech Mono",monospace';ctx.fillStyle=GLOW;ctx.textAlign='right';ctx.fillText('🎮 GAMEPAD',W-25,H-20);ctx.restore();}
+  }
+}
+
+function cleanup3D(){
+  while(scene3.children.length>0) scene3.remove(scene3.children[0]);
+  asteroids3=[]; bullets3=[]; particles3d=[]; enemyBullets3=[];
+  deathStar3=null; deathStarHP=0;
+  starField = null; starLinesMesh = null;
+  canvas3d.style.display='none';
+  canvas2d.style.position='';canvas2d.style.zIndex='';canvas2d.style.pointerEvents='';
+  canvas2d.style.display='block';
+  killThrust();
+}
+
+// ═══════════════════════════════════════════════
+//  TRENCH RUN — immersive 2D perspective tunnel
+// ═══════════════════════════════════════════════
+let trenchState, trenchTimer, trenchScore, trenchLives, trenchDist, trenchMaxDist;
+let trenchShipX, trenchShipY, trenchSpeed, trenchBlocks, trenchBullets, trenchParticles;
+let trenchShake, trenchFireCD, trenchInvincible;
+let trenchWallSeed; // for procedural wall heights
+
+const TRENCH_BOTTOM = H - 50;
+const TRENCH_DEPTH = 250;
+
+// Hash-based random wall heights — jagged, not smooth
+function wallHeight(z, side) {
+  const seg = Math.floor(z / 36); // matches segLen
+  const hash = Math.sin(seg * 127.1 + side * 311.7 + trenchWallSeed * 43.7) * 43758.5453;
+  const rand = hash - Math.floor(hash);
+  return 1.5 + rand * 2.0;
+}
+
+// Determine if a wall block exists (random gaps)
+function wallExists(z, side) {
+  const seg = Math.floor(z / 36);
+  const hash = Math.sin(seg * 83.3 + side * 197.5 + trenchWallSeed * 29.1) * 43758.5453;
+  const rand = hash - Math.floor(hash);
+  return rand > 0.25; // 25% chance of missing
+}
+
+function initTrench() {
+  canvas2d.style.display = 'block'; canvas3d.style.display = 'none';
+  canvas2d.style.position = ''; canvas2d.style.zIndex = ''; canvas2d.style.pointerEvents = '';
+  trenchState = 'title'; trenchTimer = 0; trenchScore = 0; trenchLives = 3;
+  trenchDist = 0; trenchMaxDist = 5000;
+  trenchShipX = 0; trenchShipY = 0;
+  trenchSpeed = 3;
+  trenchBlocks = []; trenchBullets = []; trenchParticles = [];
+  trenchShake = 0; trenchFireCD = 0; trenchInvincible = 0;
+  trenchWallSeed = Math.random() * 1000;
+  for (let i = 0; i < 80; i++) {
+    spawnTrenchBlock(250 + i * 60 + Math.random() * 30);
+  }
+}
+
+function spawnTrenchBlock(z) {
+  const lane = Math.floor(Math.random() * 7) - 3;
+  const height = 0.15 + Math.random() * 1.2; // much more variation: tiny to tall
+  const w = 0.5 + Math.random() * 0.7;
+  trenchBlocks.push({ z, lane, height, w, hit: false });
+}
+
+// Perspective projection — ship is always at screen center
+// Stick Y shifts VP vertically (look up/down), X shifts laterally
+function trenchProject(x, y, z) {
+  const t = Math.max(0.005, z / TRENCH_DEPTH);
+  const perspective = 1 / (1 + t * 5);
+  const vpx = W/2 - trenchShipX * 80;
+  const vpy = H/2 - trenchShipY * 180; // VP moves with look direction
+  const baseY = H/2 + 120; // floor convergence point below ship
+  const sx = vpx + x * 220 * perspective;
+  const sy = vpy + (baseY - vpy) * perspective + y * -160 * perspective;
+  return { x: sx, y: sy, scale: perspective };
+}
+
+function updateTrench() {
+  trenchTimer++;
+  if (trenchState === 'title') {
+    if (isKey('fire') || isKey('thrust')) {
+      trenchState = 'playing'; trenchTimer = 0;
+      playStartJingle();
+    }
+    return;
+  }
+  if (trenchState === 'gameover') {
+    trenchParticles.forEach(p => { p.x += p.vx; p.y += p.vy; p.life--; });
+    trenchParticles = trenchParticles.filter(p => p.life > 0);
+    if (trenchTimer > 90 && isKey('fire')) goToMenu();
+    return;
+  }
+  if (trenchState === 'victory') {
+    trenchParticles.forEach(p => { p.x += p.vx; p.y += p.vy; p.life--; });
+    trenchParticles = trenchParticles.filter(p => p.life > 0);
+    if (trenchTimer > 120 && isKey('fire')) goToMenu();
+    return;
+  }
+
+  // ── PLAYING ──
+  if (trenchShake > 0) trenchShake -= 0.3;
+  if (trenchInvincible > 0) trenchInvincible--;
+
+  // Ship movement — X = lateral, Y = look up/down (VP height)
+  const mx = gpState.stickLX || ((keys['ArrowLeft']||keys['KeyA']) ? -1 : (keys['ArrowRight']||keys['KeyD']) ? 1 : 0);
+  const my = gpState.stickLY || ((keys['ArrowUp']||keys['KeyW']) ? -1 : (keys['ArrowDown']||keys['KeyS']) ? 1 : 0);
+  trenchShipX += mx * 0.025;
+  trenchShipY += my * 0.025;
+  trenchShipX = Math.max(-0.85, Math.min(0.85, trenchShipX));
+  trenchShipY = Math.max(-0.6, Math.min(0.6, trenchShipY));
+
+  // Advance through trench
+  const boost = isKey('thrust');
+  trenchSpeed = boost ? 4 : 2;
+  trenchDist += trenchSpeed;
+
+  // Firing
+  trenchFireCD--;
+  if (isKey('fire') && trenchFireCD <= 0) {
+    trenchBullets.push({ x: trenchShipX, y: trenchShipY, z: 0, life: 80 });
+    trenchFireCD = 8;
+    sfxShoot();
+  }
+
+  // Move bullets forward
+  trenchBullets.forEach(b => { b.z += 8; b.life--; });
+  trenchBullets = trenchBullets.filter(b => b.life > 0);
+
+  // Move blocks toward player (relative to distance)
+  // Spawn new blocks ahead
+  const maxZ = trenchBlocks.length > 0 ? Math.max(...trenchBlocks.map(b => b.z)) : 0;
+  while (maxZ < trenchDist + 5000) {
+    spawnTrenchBlock(maxZ + 60 + Math.random() * 40);
+    break; // one per frame to avoid stutter
+  }
+
+  // Bullet-block collision
+  for (let i = trenchBullets.length - 1; i >= 0; i--) {
+    for (let j = trenchBlocks.length - 1; j >= 0; j--) {
+      const b = trenchBullets[i], bl = trenchBlocks[j];
+      if (bl.hit) continue;
+      const relZ = bl.z - trenchDist;
+      const bRelZ = b.z;
+      if (Math.abs(bRelZ - relZ) < 20) {
+        const bLane = b.x * 3.5;
+        if (Math.abs(bLane - bl.lane) < bl.w) {
+          bl.hit = true;
+          trenchScore += 50;
+          sfxAsteroidExplode(2);
+          // Particles at block position
+          const proj = trenchProject(bl.lane * 0.28, bl.height * 0.5, relZ);
+          for (let k = 0; k < 8; k++) {
+            trenchParticles.push({
+              x: proj.x, y: proj.y,
+              vx: (Math.random()-0.5)*4, vy: (Math.random()-0.5)*4,
+              life: 15 + Math.random()*10, maxLife: 25
+            });
+          }
+          trenchBullets.splice(i, 1);
+          break;
+        }
+      }
+    }
+  }
+
+  // Ship-block collision
+  if (trenchInvincible <= 0) {
+    for (let j = trenchBlocks.length - 1; j >= 0; j--) {
+      const bl = trenchBlocks[j];
+      if (bl.hit) continue;
+      const relZ = bl.z - trenchDist;
+      if (relZ > -10 && relZ < 15) {
+        const shipLane = trenchShipX * 3.5;
+        if (Math.abs(shipLane - bl.lane) < bl.w * 0.6 && trenchShipY < bl.height * 0.85) {
+          // HIT!
+          trenchShake = 10;
+          trenchLives--;
+          trenchInvincible = 90;
+          sfxShipExplode();
+          for (let k = 0; k < 15; k++) {
+            trenchParticles.push({
+              x: W/2, y: H/2 + 40,
+              vx: (Math.random()-0.5)*6, vy: (Math.random()-0.5)*6,
+              life: 20 + Math.random()*15, maxLife: 35
+            });
+          }
+          if (trenchLives <= 0) {
+            trenchState = 'gameover'; trenchTimer = 0;
+            playGameOverJingle();
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Clean old blocks
+  trenchBlocks = trenchBlocks.filter(b => b.z - trenchDist > -50);
+
+  // Particles
+  trenchParticles.forEach(p => { p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy *= 0.96; p.life--; });
+  trenchParticles = trenchParticles.filter(p => p.life > 0);
+
+  // Victory check
+  if (trenchDist >= trenchMaxDist) {
+    trenchState = 'victory'; trenchTimer = 0;
+    trenchScore += 5000;
+    sfxShipExplode();
+    playStartJingle();
+    for (let k = 0; k < 50; k++) {
+      trenchParticles.push({
+        x: W/2 + (Math.random()-0.5)*200, y: H*0.3 + (Math.random()-0.5)*100,
+        vx: (Math.random()-0.5)*8, vy: (Math.random()-0.5)*8,
+        life: 30 + Math.random()*30, maxLife: 60
+      });
+    }
+  }
+}
+
+function renderTrench() {
+  ctx.save();
+  if (trenchShake > 0) ctx.translate((Math.random()-0.5)*trenchShake*2, (Math.random()-0.5)*trenchShake*2);
+
+  // Background — stars
+  ctx.fillStyle = BG; ctx.globalAlpha = 0.88; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+
+  // Faint star dots in upper sky area
+  setGlow(0.2, 2); ctx.fillStyle = GLOW;
+  for (let i = 0; i < 40; i++) {
+    const sx = ((i * 137.5 + trenchDist * 0.01) % W);
+    const sy = ((i * 97.3) % (H * 0.35));
+    ctx.globalAlpha = 0.08 + (i % 5) * 0.03;
+    ctx.beginPath(); ctx.arc(sx, sy, 0.8, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // ── Draw trench ──
+  const segments = 12;
+  const segLen = 36;
+
+  // Pre-compute which segments exist (for corridor detection)
+  const leftExists = [], rightExists = [];
+  for (let i = 0; i < segments + 1; i++) {
+    const wz = trenchDist + i * segLen;
+    leftExists[i] = wallExists(wz, -1);
+    rightExists[i] = wallExists(wz, 1);
+  }
+
+  // Draw back-to-front for correct occlusion
+  for (let i = segments - 1; i >= 0; i--) {
+    const z0 = i * segLen;
+    const z1 = (i + 1) * segLen;
+    const worldZ0 = trenchDist + z0;
+
+    const fl0 = trenchProject(-1, 0, z0), fl1 = trenchProject(-1, 0, z1);
+    const fr0 = trenchProject(1, 0, z0), fr1 = trenchProject(1, 0, z1);
+
+    const alpha = Math.max(0.04, 0.5 - i * 0.04);
+
+    // ── Floor ──
+    setGlow(alpha, 3); ctx.strokeStyle = GLOW; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(fl0.x, fl0.y); ctx.lineTo(fl1.x, fl1.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(fr0.x, fr0.y); ctx.lineTo(fr1.x, fr1.y); ctx.stroke();
+    const fc0 = trenchProject(0, 0, z0), fc1 = trenchProject(0, 0, z1);
+    ctx.globalAlpha = alpha * 0.2;
+    ctx.beginPath(); ctx.moveTo(fc0.x, fc0.y); ctx.lineTo(fc1.x, fc1.y); ctx.stroke();
+    ctx.globalAlpha = alpha;
+    if ((i + Math.floor(trenchDist * 0.03)) % 2 === 0) {
+      setGlow(alpha * 0.4, 2);
+      ctx.beginPath(); ctx.moveTo(fl0.x, fl0.y); ctx.lineTo(fr0.x, fr0.y); ctx.stroke();
+    }
+
+    // Helper: draw a wall block with HLR (fill BG first, then wireframe)
+    function drawWallBlock(side, wh, extraWidth) {
+      const s = side; // -1 left, 1 right
+      const inner = s;
+      const outer = s * (1.5 + (extraWidth || 0));
+      const iT0 = trenchProject(inner, wh, z0), iT1 = trenchProject(inner, wh, z1);
+      const oT0 = trenchProject(outer, wh, z0), oT1 = trenchProject(outer, wh, z1);
+      const iB0 = s < 0 ? fl0 : fr0;
+      const iB1 = s < 0 ? fl1 : fr1;
+      const oB0 = trenchProject(outer, 0, z0), oB1 = trenchProject(outer, 0, z1);
+
+      // ── Hidden line removal: fill inner face with BG color ──
+      ctx.save();
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+      ctx.fillStyle = BG;
+      // Fill inner face (quad: iB0, iT0, iT1, iB1)
+      ctx.beginPath();
+      ctx.moveTo(iB0.x, iB0.y); ctx.lineTo(iT0.x, iT0.y);
+      ctx.lineTo(iT1.x, iT1.y); ctx.lineTo(iB1.x, iB1.y);
+      ctx.closePath(); ctx.fill();
+      // Fill top face (quad: iT0, oT0, oT1, iT1)
+      ctx.beginPath();
+      ctx.moveTo(iT0.x, iT0.y); ctx.lineTo(oT0.x, oT0.y);
+      ctx.lineTo(oT1.x, oT1.y); ctx.lineTo(iT1.x, iT1.y);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      // ── Wireframe on top ──
+      setGlow(alpha, 3); ctx.strokeStyle = GLOW; ctx.lineWidth = 1;
+      // Inner face: front vertical
+      ctx.beginPath(); ctx.moveTo(iB0.x, iB0.y); ctx.lineTo(iT0.x, iT0.y); ctx.stroke();
+      // Inner face: back vertical (dimmer)
+      ctx.globalAlpha = alpha * 0.5;
+      ctx.beginPath(); ctx.moveTo(iB1.x, iB1.y); ctx.lineTo(iT1.x, iT1.y); ctx.stroke();
+      // Inner face: top edge
+      ctx.globalAlpha = alpha * 0.7;
+      ctx.beginPath(); ctx.moveTo(iT0.x, iT0.y); ctx.lineTo(iT1.x, iT1.y); ctx.stroke();
+      // Top surface edges
+      ctx.beginPath(); ctx.moveTo(iT0.x, iT0.y); ctx.lineTo(oT0.x, oT0.y); ctx.stroke();
+      ctx.globalAlpha = alpha * 0.5;
+      ctx.beginPath(); ctx.moveTo(iT1.x, iT1.y); ctx.lineTo(oT1.x, oT1.y); ctx.stroke();
+      // Outer top edge
+      ctx.globalAlpha = alpha * 0.4;
+      ctx.beginPath(); ctx.moveTo(oT0.x, oT0.y); ctx.lineTo(oT1.x, oT1.y); ctx.stroke();
+      // Outer face: front vertical
+      ctx.globalAlpha = alpha * 0.3;
+      ctx.beginPath(); ctx.moveTo(oB0.x, oB0.y); ctx.lineTo(oT0.x, oT0.y); ctx.stroke();
+      // Panel detail at mid-height
+      ctx.globalAlpha = alpha * 0.12;
+      const mid0 = trenchProject(inner, wh * 0.5, z0), mid1 = trenchProject(inner, wh * 0.5, z1);
+      ctx.beginPath(); ctx.moveTo(mid0.x, mid0.y); ctx.lineTo(mid1.x, mid1.y); ctx.stroke();
+
+      // If this is a corridor entrance (previous was gap), draw back wall
+      if (extraWidth > 0) {
+        ctx.globalAlpha = alpha * 0.35;
+        // Back wall of corridor: vertical line at z0 from inner to outer
+        const cMid = trenchProject(inner + s * (extraWidth * 0.5), wh * 0.7, z0);
+        ctx.beginPath(); ctx.moveTo(oB0.x, oB0.y); ctx.lineTo(oT0.x, oT0.y); ctx.stroke();
+        // Corridor depth hint lines
+        ctx.globalAlpha = alpha * 0.15;
+        const deep0 = trenchProject(outer, 0, z0 - 15);
+        const deep1 = trenchProject(outer, wh, z0 - 15);
+        ctx.beginPath(); ctx.moveTo(oB0.x, oB0.y); ctx.lineTo(deep0.x, deep0.y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(oT0.x, oT0.y); ctx.lineTo(deep1.x, deep1.y); ctx.stroke();
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    // ── Left wall ──
+    if (leftExists[i]) {
+      // Check if previous segment was a gap → corridor entrance
+      const prevGap = (i > 0) && !leftExists[i - 1]; // segment closer to player was empty
+      const corridorExtra = prevGap ? 0.8 : 0;
+      const lwh = wallHeight(worldZ0, -1);
+      drawWallBlock(-1, lwh, corridorExtra);
+    }
+
+    // ── Right wall ──
+    if (rightExists[i]) {
+      const prevGap = (i > 0) && !rightExists[i - 1];
+      const corridorExtra = prevGap ? 0.8 : 0;
+      const rwh = wallHeight(worldZ0, 1);
+      drawWallBlock(1, rwh, corridorExtra);
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  // ── Draw blocks (back to front for correct overlap) ──
+  const sortedBlocks = trenchBlocks
+    .filter(bl => !bl.hit && bl.z - trenchDist > -20 && bl.z - trenchDist < TRENCH_DEPTH)
+    .sort((a, b) => b.z - a.z);
+
+  sortedBlocks.forEach(bl => {
+    const relZ = bl.z - trenchDist;
+    const bx = bl.lane * 0.28;
+    const hw = bl.w * 0.14;
+    const dz = 12;
+    const p0 = trenchProject(bx-hw, 0, relZ), p1 = trenchProject(bx+hw, 0, relZ);
+    const p2 = trenchProject(bx+hw, bl.height, relZ), p3 = trenchProject(bx-hw, bl.height, relZ);
+    const p4 = trenchProject(bx-hw, 0, relZ+dz), p5 = trenchProject(bx+hw, 0, relZ+dz);
+    const p6 = trenchProject(bx+hw, bl.height, relZ+dz), p7 = trenchProject(bx-hw, bl.height, relZ+dz);
+
+    const alpha = Math.max(0.1, 0.9 - relZ / TRENCH_DEPTH);
+
+    // HLR: fill front face and top face with BG
+    ctx.save(); ctx.globalAlpha = 1; ctx.shadowBlur = 0; ctx.fillStyle = BG;
+    ctx.beginPath(); ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.lineTo(p3.x,p3.y); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(p3.x,p3.y); ctx.lineTo(p2.x,p2.y); ctx.lineTo(p6.x,p6.y); ctx.lineTo(p7.x,p7.y); ctx.closePath(); ctx.fill();
+    // Right side face
+    ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p5.x,p5.y); ctx.lineTo(p6.x,p6.y); ctx.lineTo(p2.x,p2.y); ctx.closePath(); ctx.fill();
+    ctx.restore();
+
+    // Wireframe
+    setGlow(alpha, 5); ctx.strokeStyle = GLOW; ctx.lineWidth = 1.2;
+    // Front face
+    ctx.beginPath(); ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.lineTo(p3.x,p3.y); ctx.closePath(); ctx.stroke();
+    // Top face
+    ctx.globalAlpha = alpha * 0.5;
+    ctx.beginPath(); ctx.moveTo(p3.x,p3.y); ctx.lineTo(p2.x,p2.y); ctx.lineTo(p6.x,p6.y); ctx.lineTo(p7.x,p7.y); ctx.closePath(); ctx.stroke();
+    // Side edges
+    ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p5.x,p5.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(p2.x,p2.y); ctx.lineTo(p6.x,p6.y); ctx.stroke();
+    ctx.globalAlpha = 1;
+  });
+
+  // ── Draw bullets ──
+  trenchBullets.forEach(b => {
+    const p = trenchProject(b.x, b.y + 0.1, b.z);
+    if (p.scale < 0.01) return;
+    setGlow(1, 10); ctx.fillStyle = GLOW;
+    ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(1, 3 * p.scale * 5), 0, Math.PI * 2); ctx.fill();
+  });
+
+  // ── Particles ──
+  trenchParticles.forEach(p => {
+    const alpha = p.life / p.maxLife;
+    setGlow(alpha * 0.8, 4); ctx.fillStyle = GLOW;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 2 * alpha, 0, Math.PI * 2); ctx.fill();
+  });
+
+  // ── Draw ship (X-wing from behind) — always at screen center ──
+  if (trenchState === 'playing') {
+    const shipSX = W/2;
+    const shipSY = H/2 + 40; // slightly below center (cockpit view feeling)
+    const flicker = trenchInvincible > 0 && Math.floor(trenchInvincible/3) % 2;
+    if (!flicker) {
+      ctx.save();
+      ctx.translate(shipSX, shipSY);
+      const tilt = -(gpState.stickLX || ((keys['ArrowLeft']||keys['KeyA']) ? -1 : (keys['ArrowRight']||keys['KeyD']) ? 1 : 0)) * 0.2;
+      ctx.rotate(tilt);
+      ctx.scale(1.4, 1.4); // bigger ship
+      setGlow(1, 10); ctx.strokeStyle = GLOW; ctx.lineWidth = 1.5;
+      // Fuselage
+      ctx.beginPath(); ctx.moveTo(0, -14); ctx.lineTo(-3, 10); ctx.lineTo(3, 10); ctx.closePath(); ctx.stroke();
+      // Wings (X shape)
+      ctx.beginPath(); ctx.moveTo(-3, 2); ctx.lineTo(-22, -8); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-3, 5); ctx.lineTo(-20, 12); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(3, 2); ctx.lineTo(22, -8); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(3, 5); ctx.lineTo(20, 12); ctx.stroke();
+      // Engines
+      setGlow(0.6 + Math.random()*0.3, 8);
+      ctx.beginPath(); ctx.arc(-2, 12, 2, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(2, 12, 2, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // ── HUD ──
+  if (trenchState === 'title') {
+    setGlow(1, 20); ctx.fillStyle = GLOW; ctx.textAlign = 'center';
+    ctx.font = '48px "Share Tech Mono",monospace'; ctx.fillText('TRENCH RUN', W/2, H/2 - 60);
+    setGlow(0.6, 10); ctx.font = '14px "Share Tech Mono",monospace';
+    ctx.fillText('— REACH THE EXHAUST PORT —', W/2, H/2 - 20);
+    if (Math.sin(Date.now()*0.005) > 0) {
+      setGlow(0.8, 10); ctx.font = '18px "Share Tech Mono",monospace';
+      ctx.fillText('PRESS SPACE TO START', W/2, H/2 + 50);
+    }
+    setGlow(0.35, 4); ctx.font = '11px "Share Tech Mono",monospace';
+    ctx.fillText('STICK MOVER · LT BOOST · ESPACIO/RT DISPARAR', W/2, H/2 + 100);
+  } else if (trenchState === 'gameover') {
+    setGlow(1, 20); ctx.fillStyle = GLOW; ctx.textAlign = 'center';
+    ctx.font = '48px "Share Tech Mono",monospace'; ctx.fillText('GAME OVER', W/2, H/2 - 30);
+    setGlow(0.7, 8); ctx.font = '22px "Share Tech Mono",monospace';
+    ctx.fillText('SCORE: ' + trenchScore, W/2, H/2 + 20);
+    if (trenchTimer > 90) {
+      const p = 0.45 + Math.sin(Date.now()*0.004)*0.35;
+      setGlow(p, 8+p*4); ctx.font = '16px "Share Tech Mono",monospace';
+      ctx.fillText('PRESS SPACE TO CONTINUE', W/2, H/2 + 70);
+    }
+  } else if (trenchState === 'victory') {
+    setGlow(1, 24); ctx.fillStyle = '#ff4444'; ctx.textAlign = 'center';
+    ctx.font = '42px "Share Tech Mono",monospace';
+    ctx.shadowColor = '#ff4444';
+    const blink = Math.sin(Date.now()*0.008) > -0.3;
+    if (blink) ctx.fillText('★ DEATH STAR DESTROYED ★', W/2, H/2 - 30);
+    setGlow(0.8, 8); ctx.fillStyle = GLOW; ctx.shadowColor = GLOW;
+    ctx.font = '22px "Share Tech Mono",monospace';
+    ctx.fillText('SCORE: ' + trenchScore, W/2, H/2 + 20);
+    if (trenchTimer > 120) {
+      const p = 0.45 + Math.sin(Date.now()*0.004)*0.35;
+      setGlow(p, 8+p*4); ctx.font = '16px "Share Tech Mono",monospace';
+      ctx.fillText('PRESS SPACE TO CONTINUE', W/2, H/2 + 70);
+    }
+  } else {
+    // Playing HUD
+    setGlow(0.9, 6); ctx.font = '22px "Share Tech Mono",monospace'; ctx.fillStyle = GLOW; ctx.textAlign = 'left';
+    ctx.fillText(String(trenchScore).padStart(6, '0'), 25, 40);
+    // Lives
+    for (let i = 0; i < trenchLives; i++) {
+      ctx.save(); ctx.translate(35+i*28, 65); ctx.rotate(-Math.PI/2); ctx.scale(0.6,0.6);
+      setGlow(0.7, 4);
+      drawPoly([{x:18,y:0},{x:-12,y:-10},{x:-7,y:0},{x:-12,y:10}], true);
+      ctx.restore();
+    }
+    // Distance bar
+    const pct = Math.min(1, trenchDist / trenchMaxDist);
+    const dbW = 300, dbH = 8, dbX = W/2 - dbW/2, dbY = 30;
+    setGlow(0.4, 4); ctx.strokeStyle = GLOW; ctx.lineWidth = 1;
+    ctx.strokeRect(dbX, dbY, dbW, dbH);
+    ctx.fillStyle = pct > 0.9 ? '#ff4444' : GLOW;
+    ctx.globalAlpha = 0.6;
+    ctx.fillRect(dbX+1, dbY+1, (dbW-2)*pct, dbH-2);
+    ctx.globalAlpha = 1;
+    setGlow(0.5, 3); ctx.font = '10px "Share Tech Mono",monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = GLOW;
+    ctx.fillText('EXHAUST PORT', W/2, dbY - 4);
+    // Target marker at end of bar
+    setGlow(0.8, 6); ctx.fillStyle = '#ff4444';
+    ctx.beginPath(); ctx.arc(dbX + dbW, dbY + dbH/2, 4, 0, Math.PI*2); ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════
+let startDebounce = 0;
+
+function goToMenu() {
+  killThrust();
+  if (currentMode === '3d') cleanup3D();
+  currentMode = 'menu';
+  menuDebounce = 20;
+  startDebounce = 30;
+}
+
+function mainLoop(){
+  pollGamepad();
+  startDebounce--;
+
+  // Start button / Escape → back to menu from anywhere (except menu itself)
+  if (currentMode !== 'menu' && startDebounce <= 0) {
+    if (gpState.start || keys['Escape']) {
+      goToMenu();
+    }
+  }
+
+  if(currentMode==='menu'){
+    canvas2d.style.display='block';canvas3d.style.display='none';
+    canvas2d.style.position='';canvas2d.style.zIndex='';canvas2d.style.pointerEvents='';
+    updateMenu(); drawMenu();
+  }else if(currentMode==='2d'){
+    update2D(); render2D();
+  }else if(currentMode==='3d'){
+    update3D(); render3D();
+  }else if(currentMode==='trench'){
+    updateTrench(); renderTrench();
+  }
+  requestAnimationFrame(mainLoop);
+}
+
+currentMode='menu';
+mainLoop();
+</script>
+</body>
+</html>
